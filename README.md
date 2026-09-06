@@ -20,7 +20,7 @@ Thankfully this README was human written, even if everything else wasn't.
 ## Explanations of input options (it's complicated)
 
 Usage:
-  velfilter_smart.exe input.mid output.mid [options]
+  `velfilter_smart.exe input.mid output.mid [options]`
 
 Velocity (pretty intuitive):
 
