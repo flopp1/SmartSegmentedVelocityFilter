@@ -24,40 +24,40 @@ Usage:
 
 Velocity (pretty intuitive):
 
-  --low N              low-band cutoff (default 30) 
+  `--low N`              low-band cutoff (default 30) 
   
-  --high N             high-band cutoff (default 70)
+  `--high N`             high-band cutoff (default 70)
   
-  --peak N             isolated-note rescue threshold (default 100)
+  `--peak N`             isolated-note rescue threshold (default 100)
 
 Segmentation:
 
-  --segment-seconds N  target segment length in wall-clock
+  `--segment-seconds N`  target segment length in wall-clock
                        seconds; boundaries snap to dyadic
                        divisions/multiples of a measure
                        (default 2.0 = one measure at the
                        120 BPM base tempo)
                        
-  --snap-divisions N   snap grid = measure / 2^N (default 2 =
+  `--snap-divisions N`   snap grid = measure / 2^N (default 2 =
                        quarter-bar; 0 = bar lines only)
                        
 ^ Defaults should be fine, only change if stuff is cut off weirdly or takes a bit of time before the next segment is removed.
 
 Masking:
 
-  --mask-share N       minimum MIDI energy share (default 0.01)
+  `--mask-share N`       minimum MIDI energy share (default 0.01)
   
-  --trend-threshold N  rising-velocity tiebreaker for ambiguous
+  `--trend-threshold N`  rising-velocity tiebreaker for ambiguous
                        segments (default 12)
                        
 ^ I did not touch these at all in forever, it probably doesn't even do much. Relic from the earlier attempts at discerning audio and arts that was obviously not very successful, and then repurposed into god knows what. Don't touch it either.
 
 Energy / Envelope (single exponential decay model):
 
-  --tau-ms N               tau in ms for the exponential decay
+  `--tau-ms N`               tau in ms for the exponential decay
                            model (default 0 = 500) - Higher makes a less steep drop off in simulated audio energy, lower a more steep drop
                            
-  --global-polyphony-cap N approximate max concurrent audible voices;
+  `--global-polyphony-cap N` approximate max concurrent audible voices;
                            caps the global energy curve to model a
                            real synth's voice stealing/limiting, so
                            a dense crash's held/decaying note count
@@ -67,7 +67,7 @@ Energy / Envelope (single exponential decay model):
 
 Realtime audibility (intensity-relative removal scale):
 
-  --audibility-ratio N own mean held-voice level vs the level of the
+  `--audibility-ratio N` own mean held-voice level vs the level of the
                        other voices sounding at the same moment;
                        segments at or above this fraction are heard
                        on a realtime (voice-limited) synth and kept
@@ -77,7 +77,7 @@ Realtime audibility (intensity-relative removal scale):
                        
 ^ Fucking complicated shit that GLM came up with after 1 whole hour. Something like a low and medium velocity band filter thing, you need to raise it to like 5, 10 or 20 for fatass merges like DYHTM.
  
-  --ambient-gate N     low-band rescue gate: the local ambient level
+  `--ambient-gate N`     low-band rescue gate: the local ambient level
                        must reach this fraction of the file's
                        typical sounding level before quiet segments
                        are rescued, so art passages dominated by
@@ -92,20 +92,20 @@ Realtime audibility (intensity-relative removal scale):
 
 Other:
 
-  --threads N          worker threads for the per-track scan
+  `--threads N`          worker threads for the per-track scan
                        phases (default 0 = all hardware
                        threads, output is identical) - Don't change unless you want the thing to run like Master Oogway does.
                        
-  --global-bin-ms N    masking curve resolution (default 50) - Pretty fucking coarse but I'm not interested in blowing up time complexity just for a bit more fine grainedness, which won't even matter anyway since segments are on the level of a second or two.
+  `--global-bin-ms N`    masking curve resolution (default 50) - Pretty fucking coarse but I'm not interested in blowing up time complexity just for a bit more fine grainedness, which won't even matter anyway since segments are on the level of a second or two.
   
-  --verbose            print segment decisions - If you want the program to projectile vomit information at you.
+  `--verbose`            print segment decisions - If you want the program to projectile vomit information at you.
   
-  --no-prefetch        skip the PrefetchVirtualMemory warm-up before
+  `--no-prefetch`        skip the PrefetchVirtualMemory warm-up before
                        Phase 1b (Phase 1b is the first full-file
                        read; the prefetch turns a cold-cache
                        demand-page stall into one sequential read) - I hate Windows memory mapping. Don't disable prefetch or cold files will take until all hell freezes over to load from disk.
                        
-  --no-global-move     do not consolidate globals into track 0 - I don't even know if this works, I assume it does. I don't know why you'd want this but sure.
+  `--no-global-move`     do not consolidate globals into track 0 - I don't even know if this works, I assume it does. I don't know why you'd want this but sure.
 
 
   ### Disclaimer
