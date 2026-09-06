@@ -13,6 +13,10 @@ This is not a foolproof art remover, but I'd say it does a pretty damn well good
 
 Don't complain if quiet phrases or decreasing velocity phrases are cut off or whatever, those are a pain in the ass and I'm working on it.
 
+Compile with `g++ -O3 -std=c++17 -Wall -municode -o velfilter_smart.exe velfilter_smart.cpp` or whatever the equivalent is with Clang. Don't expect MSVC to work, it's weird and quirky. 
+
+Thankfully this README was human written, even if everything else wasn't.
+
 ## Explanations of input options (it's complicated)
 
 Usage:
