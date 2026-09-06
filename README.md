@@ -74,7 +74,8 @@ Realtime audibility (intensity-relative removal scale):
                        even where the rendered mix would bury them
                        (default 1.25, ~+2dB; 0.30 ~-10dB suits
                        sparse files)
-                       ^ Fucking complicated shit that GLM came up with after 1 whole hour. Something like a low and medium velocity band filter thing, you need to raise it to like 5, 10 or 20 for fatass merges like DYHTM.
+                       
+^ Fucking complicated shit that GLM came up with after 1 whole hour. Something like a low and medium velocity band filter thing, you need to raise it to like 5, 10 or 20 for fatass merges like DYHTM.
  
   --ambient-gate N     low-band rescue gate: the local ambient level
                        must reach this fraction of the file's
@@ -82,7 +83,8 @@ Realtime audibility (intensity-relative removal scale):
                        are rescued, so art passages dominated by
                        their own quiet notes stay dropped (default
                        1.0)
-                       ^ More fucking complicated shit from GLM. This one's for low velocity rescuing only but dependent on the relative energy levels of different parts, basically another attempt to filter arts and melody and noise and whatnot. Testing is around the same values as the audibility ratio on heavy merges too.
+                       
+^ More fucking complicated shit from GLM. This one's for low velocity rescuing only but dependent on the relative energy levels of different parts, basically another attempt to filter arts and melody and noise and whatnot. Testing is around the same values as the audibility ratio on heavy merges too.
                        
 ^ This entire thing was absolutely fucked. Don't blame me if it's half working or half baked. I blame the fact that realtime synth and rendered audio levels and phrase audibility are completely different, especially in fatass sustain crashes and different MIDIs have audio catering to both, which is a nightmare to try and generalise for this program.
 
