@@ -5,16 +5,29 @@
 #define NOMINMAX
 #include <windows.h>
 
+// GetProcessMemoryInfo for RAM usage reporting. On MinGW, compile
+// with -lpsapi if the linker cannot resolve it (on MSVC the pragma
+// below handles it).
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")
+#endif
+#include <psapi.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cwchar>
 #include <cstdio>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <cstring>
 
@@ -190,6 +203,19 @@ struct FileWriter {
             static_cast<uint8_t>(v)
         };
         return write_bytes(b, 4);
+    }
+
+    // Current write offset, for recording chunk positions in the
+    // rescue-pass scratch file. WriteFile is unbuffered, so the file
+    // pointer is always exact.
+    uint64_t tell() const {
+        LARGE_INTEGER zero{};
+        LARGE_INTEGER pos{};
+
+        if (!SetFilePointerEx(file, zero, &pos, FILE_CURRENT))
+            return UINT64_MAX;
+
+        return static_cast<uint64_t>(pos.QuadPart);
     }
 };
 
@@ -493,21 +519,28 @@ static bool is_global_meta(uint8_t type) {
 }
 
 struct Note {
-    uint64_t start_tick = 0;
-    uint64_t end_tick = 0;
-
+    // Compact layout (36 bytes, down from 48). Hot fields (start_us /
+    // end_us, used in every per-segment inner loop) sit first so they
+    // share cache lines. Ticks are uint32: the parse path in
+    // analyze_track_into_vector rejects any track whose tick exceeds
+    // 2^32-1, so a value that doesn't fit is a hard error rather than
+    // a silent wrap. keep is a byte so the struct stays padded-free.
     uint64_t start_us = 0;
     uint64_t end_us = 0;
+
+    uint32_t start_tick = 0;
+    uint32_t end_tick = 0;
+
+    int32_t prev_same = -1;
+    int32_t poly_at_on = 0;
 
     uint8_t velocity = 0;
     uint8_t pitch = 0;
     uint8_t channel = 0;
-
-    int32_t prev_same = -1;
-    int poly_at_on = 0;
-
-    bool keep = false;
+    uint8_t keep = 0;
 };
+
+static_assert(sizeof(Note) <= 40, "Note grew larger than the packed layout");
 
 struct GlobalEvent {
     uint64_t tick = 0;
@@ -546,6 +579,13 @@ struct Segment {
     double ambient_level = 0.0;
     double audibility_ratio = 0.0;
 
+    // The ratio bar actually applied by the decision logic (base
+    // audibility_ratio folded with hysteresis back-off and crash
+    // leniency; the low band multiplies it by 1.75). Stored so the
+    // rescue pass can flag Drop segments that only just missed
+    // *their* bar, rather than the static config value.
+    double ratio_bar = 0.0;
+
     int max_polyphony = 0;
     int max_velocity = 0;
 
@@ -556,6 +596,131 @@ struct Segment {
         KeepAll,
         Cluster
     } mode = Mode::Drop;
+
+    // Tracks which condition was decisive for this segment's fate.
+    // Used by SegmentStats to report per-mechanism note counts.
+    enum class DecisionReason : uint8_t {
+        None,
+        HighBand,      // avg_velocity >= high_velocity → KeepAll
+        MidShare,      // mid band, share ≥ mask_share → KeepAll
+        MidRatio,      // mid band, ratio ≥ bar → KeepAll
+        MidCluster,    // mid band, bimodal/peak/trend → Cluster
+        MidDrop,       // mid band, nothing kept it → Drop
+        LowRatio,      // low band, gate passed + ratio ≥ bar*1.75 → KeepAll
+        LowGateDrop,   // low band, gate blocked rescue → Drop
+        LowRatioDrop,  // low band, gate passed but ratio failed → Drop
+        LowCluster,    // low band, bimodal/peak/trend → Cluster
+    } reason = DecisionReason::None;
+};
+
+// Per-track and global note-level decision statistics. Counts notes
+// by which condition was decisive for their segment's keep/drop fate.
+// Minimal overhead: one counter increment per segment (not per note).
+struct SegmentStats {
+    uint64_t high_band_kept = 0;
+    uint64_t mid_ratio_kept = 0;
+    uint64_t mid_share_kept = 0;
+    uint64_t mid_cluster = 0;
+    uint64_t mid_dropped = 0;
+    uint64_t low_ratio_kept = 0;
+    uint64_t low_cluster = 0;
+    uint64_t low_gate_dropped = 0;
+    uint64_t low_ratio_dropped = 0;
+
+    uint64_t total_kept() const {
+        return high_band_kept + mid_ratio_kept + mid_share_kept +
+               mid_cluster + low_ratio_kept + low_cluster;
+    }
+
+    uint64_t total_dropped() const {
+        return mid_dropped + low_gate_dropped + low_ratio_dropped;
+    }
+
+    uint64_t total() const {
+        return total_kept() + total_dropped();
+    }
+
+    void add(const SegmentStats& o) {
+        high_band_kept += o.high_band_kept;
+        mid_ratio_kept += o.mid_ratio_kept;
+        mid_share_kept += o.mid_share_kept;
+        mid_cluster += o.mid_cluster;
+        mid_dropped += o.mid_dropped;
+        low_ratio_kept += o.low_ratio_kept;
+        low_cluster += o.low_cluster;
+        low_gate_dropped += o.low_gate_dropped;
+        low_ratio_dropped += o.low_ratio_dropped;
+    }
+
+    void print() const {
+        uint64_t total_ = total();
+
+        if (total_ == 0)
+            return;
+
+        auto pct = [total_](uint64_t n) -> double {
+            return total_ ? 100.0 * n / total_ : 0.0;
+        };
+
+        std::printf(
+            "\nDecision breakdown (%llu notes):\n",
+            static_cast<unsigned long long>(total_)
+        );
+
+        std::printf(
+            "  Audibility ratio kept:    %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(mid_ratio_kept + low_ratio_kept),
+            pct(mid_ratio_kept + low_ratio_kept)
+        );
+
+        std::printf(
+            "  Ambient gate rescued:     %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(low_ratio_kept),
+            pct(low_ratio_kept)
+        );
+
+        std::printf(
+            "  High band kept:           %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(high_band_kept),
+            pct(high_band_kept)
+        );
+
+        std::printf(
+            "  Mask share kept:          %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(mid_share_kept),
+            pct(mid_share_kept)
+        );
+
+        std::printf(
+            "  Cluster (bimodal/peak):   %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(mid_cluster + low_cluster),
+            pct(mid_cluster + low_cluster)
+        );
+
+        std::printf(
+            "  Dropped (ratio failed):   %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(mid_dropped + low_ratio_dropped),
+            pct(mid_dropped + low_ratio_dropped)
+        );
+
+        std::printf(
+            "  Dropped (gate blocked):   %llu (%.1f%%)\n",
+            static_cast<unsigned long long>(low_gate_dropped),
+            pct(low_gate_dropped)
+        );
+
+        std::printf(
+            "  Ratio+gate kept:          %llu (%.1f%%) [low band]\n",
+            static_cast<unsigned long long>(low_ratio_kept),
+            pct(low_ratio_kept)
+        );
+
+        std::printf(
+            "  Ratio kept (no gate):     %llu (%.1f%%) [mid band]\n",
+            static_cast<unsigned long long>(mid_ratio_kept),
+            pct(mid_ratio_kept)
+        );
+    }
 };
 
 struct TrackInfo {
@@ -575,6 +740,12 @@ struct TrackInfo {
 
     bool has_notes = false;
     size_t kept_notes = 0;
+
+    // Set by pass 1 of the rescue second pass when any final Drop
+    // segment only just missed its ratio bar. The track is then not
+    // written in pass 1; it is re-decided against the post-filter
+    // ambient and written afterwards. Never set for track 0.
+    bool flagged = false;
 
     double raw_average_velocity = 0.0;
     uint8_t raw_max_velocity = 0;
@@ -697,37 +868,75 @@ struct Config {
     // nothing left to mask anything, and quiet content after a crash
     // is exactly what must not be removed.
     double ambient_gate = 1.0;
+
+    // ------------------------------------------------------------------
+    // Rescue second pass. Pass-1 decisions are made against the
+    // ORIGINAL file's ambient. Wherever removal thins that ambient,
+    // borderline content that was correctly dropped against the full
+    // mix becomes audible in the thinner output - the lossy-filter
+    // exposure problem. With second_pass on, a track whose final
+    // decisions include a Drop segment that only just missed its
+    // ratio bar is flagged, the voice-model curves are rebuilt from
+    // exactly the notes pass 1 kept (the post-filter ambient), and
+    // the flagged tracks are re-decided against those curves. Only
+    // thinned windows re-decide differently, so clear-cut regions are
+    // untouched. One correction step toward the fixed point, not
+    // full convergence; rescue-direction only (the post ambient is
+    // never louder than the original, so kept segments never flip).
+    // Track 0 (the format 1 conductor) is never deferred.
+    // ------------------------------------------------------------------
+    bool second_pass = false;
+
+    // How close to its ratio bar a Drop segment must be to flag its
+    // track for the rescue pass: flag when
+    //   audibility_ratio >= rescue_margin * ratio_bar.
+    // 1.0 flags only exact misses; lower flags more tracks (more
+    // rescue, more re-processing runtime).
+    double rescue_margin = 0.80;
+
+    // With second_pass: preserve the output's physical track order by
+    // default - re-decided tracks are written back into their original
+    // position via a scratch file (output path + ".vfscratch").
+    // --no-preserve-track-order opts out: re-decided tracks are then
+    // appended after the clean tracks (zero extra I/O, smaller memory;
+    // players don't care beyond conductor-first, which is preserved
+    // either way).
+    bool preserve_track_order = true;
 };
 
 struct TempoSegment {
     uint64_t tick = 0;
-    long double cumulative_us = 0;
+    // double is plenty: cumulative_us for even a 1000-hour file is
+    // ~3.6e12, well under 2^53, so the representation stays exact to
+    // far below a microsecond. long double bought nothing and cost
+    // the per-note conversion path its fast path.
+    double cumulative_us = 0;
     uint32_t us_per_qn = 500000;
 };
 
 struct TempoMap {
     bool smpte = false;
-    long double us_per_tick = 0;
+    double us_per_tick = 0;
     uint16_t division = 480;
 
     std::vector<TempoSegment> segments;
 
     uint64_t tick_to_us(uint64_t tick) const {
         if (smpte) {
-            long double value =
-                static_cast<long double>(tick) * us_per_tick;
+            double value =
+                static_cast<double>(tick) * us_per_tick;
 
-            if (value >= static_cast<long double>(
+            if (value >= static_cast<double>(
                 std::numeric_limits<uint64_t>::max()
             ))
                 return std::numeric_limits<uint64_t>::max();
 
-            return static_cast<uint64_t>(value + 0.5L);
+            return static_cast<uint64_t>(value + 0.5);
         }
 
         if (segments.empty())
             return static_cast<uint64_t>(
-                static_cast<long double>(tick) * 500000.0L / division
+                static_cast<double>(tick) * 500000.0 / division
             );
 
         auto it = std::upper_bound(
@@ -746,18 +955,18 @@ struct TempoMap {
 
         const TempoSegment& s = *it;
 
-        long double result =
+        double result =
             s.cumulative_us +
-            static_cast<long double>(tick - s.tick) *
-            static_cast<long double>(s.us_per_qn) /
-            static_cast<long double>(division);
+            static_cast<double>(tick - s.tick) *
+            static_cast<double>(s.us_per_qn) /
+            static_cast<double>(division);
 
-        if (result >= static_cast<long double>(
+        if (result >= static_cast<double>(
             std::numeric_limits<uint64_t>::max()
         ))
             return std::numeric_limits<uint64_t>::max();
 
-        return static_cast<uint64_t>(result + 0.5L);
+        return static_cast<uint64_t>(result + 0.5);
     }
 };
 
@@ -786,18 +995,18 @@ struct TempoCursor {
 
         const TempoSegment& s = map->segments[idx];
 
-        long double result =
+        double result =
             s.cumulative_us +
-            static_cast<long double>(tick - s.tick) *
-            static_cast<long double>(s.us_per_qn) /
-            static_cast<long double>(map->division);
+            static_cast<double>(tick - s.tick) *
+            static_cast<double>(s.us_per_qn) /
+            static_cast<double>(map->division);
 
-        if (result >= static_cast<long double>(
+        if (result >= static_cast<double>(
             std::numeric_limits<uint64_t>::max()
         ))
             return std::numeric_limits<uint64_t>::max();
 
-        return static_cast<uint64_t>(result + 0.5L);
+        return static_cast<uint64_t>(result + 0.5);
     }
 };
 
@@ -826,9 +1035,9 @@ static TempoMap build_tempo_map(
             ticks_per_frame = 1;
 
         map.us_per_tick =
-            1000000.0L /
-            (static_cast<long double>(fps) *
-             static_cast<long double>(ticks_per_frame));
+            1000000.0 /
+            (static_cast<double>(fps) *
+             static_cast<double>(ticks_per_frame));
 
         return map;
     }
@@ -853,7 +1062,7 @@ static TempoMap build_tempo_map(
 
     uint64_t current_tick = 0;
     uint32_t current_tempo = 500000;
-    long double cumulative = 0;
+    double cumulative = 0;
 
     map.segments.push_back({
         0,
@@ -875,9 +1084,9 @@ static TempoMap build_tempo_map(
 
         if (ev.tick > current_tick) {
             cumulative +=
-                static_cast<long double>(ev.tick - current_tick) *
-                static_cast<long double>(current_tempo) /
-                static_cast<long double>(division);
+                static_cast<double>(ev.tick - current_tick) *
+                static_cast<double>(current_tempo) /
+                static_cast<double>(division);
 
             current_tick = ev.tick;
         }
@@ -1063,6 +1272,23 @@ struct GlobalStats {
     // lose their anchor.
     double ambient_typical = 0.0;
 
+    
+    // Crash-leniency curve (see build_leniency_curve): 0..1 per bin.
+    std::vector<float> leniency;
+
+    // O(1) read-only lookup, safe from the parallel Phase 2b workers.
+    double leniency_at(uint64_t t) const {
+        if (leniency.empty())
+            return 0.0;
+
+        size_t bin = static_cast<size_t>(t / bin_us);
+
+        if (bin >= leniency.size())
+            bin = leniency.size() - 1;
+
+        return static_cast<double>(leniency[bin]);
+    }
+
     //Forward declaration of build_from_scan function because circular dependency lol
     void build_from_scan(
         const uint8_t* file_begin,
@@ -1203,6 +1429,227 @@ static size_t significant_voice_bins(uint64_t bin_us, long double tau_us) {
     return result < 1 ? 1 : result;
 }
 
+// ------------------------------------------------------------------
+// Per-note voice-model diff accumulation, shared by the Phase 2a
+// global scan and the Phase 2b kept-note (post-filter) scan. A note
+// occupies one synth voice over [start, end) and contributes its
+// tau-decayed level while held; both facts go into a pair of diff
+// arrays with O(1) work per note, exactly as the global curves are
+// built. impulse_diff, when given, additionally records the note-on
+// impulse the energy curve needs (pass 2 uses it to rebuild the
+// share-test curve from kept notes only).
+// ------------------------------------------------------------------
+struct VoiceDiffs {
+    std::vector<int64_t> count_diff;
+    std::vector<int64_t> energy_diff;
+};
+
+// ------------------------------------------------------------------
+// Rescue second-pass accumulation. Pass 1 feeds every kept note into
+// one of these (per worker, merged per block like Phase 2a's
+// ScanAccum pattern) so the post-filter ambient can be rebuilt
+// without rescanning the file. All four curves the decision logic
+// reads must be rebuildable from kept notes only:
+//
+//   impulse_diff  note-on impulses -> energy[]/prefix[] (share test)
+//   contrib_diff  significant-voice counts -> polyphony damping
+//   voices        held-voice count + decayed level -> ambient means,
+//                 solo anchor, ambient_typical
+//
+// Leniency is rebuilt on the post curves (see build_post_stats).
+// ------------------------------------------------------------------
+struct KeptAccum {
+    std::vector<int64_t> impulse_diff;
+    std::vector<int64_t> contrib_diff;
+    VoiceDiffs voices;
+};
+
+// Decay lookup table for the held-voice model. tab[k] = exp(-k*bin/tau)
+// for k up to the point where the level has decayed below kFloor (~1e-6
+// of onset), plus one zero sentinel at the end so an interpolated lookup
+// past the last real entry blends to ~0 (error < kFloor relative). Empty
+// table returned for degenerate bin/tau, in which case callers fall back
+// to the exact std::exp path. Built once per (bin, tau) pair and shared
+// read-only across all workers/segments; replaces one transcendental
+// (std::exp) and one 80-bit division per note in the two hottest loops.
+static std::vector<long double> build_decay_table(
+    uint64_t bin_us,
+    long double tau_us
+) {
+    std::vector<long double> tab;
+
+    if (bin_us == 0 || tau_us <= 0.0L)
+        return tab;
+
+    constexpr size_t kMaxBins = 4096;
+    constexpr long double kFloor = 1e-6L;
+
+    const long double r =
+        std::exp(-static_cast<long double>(bin_us) / tau_us);
+
+    tab.reserve(4096);
+
+    long double p = 1.0L;
+
+    for (size_t i = 0; i < kMaxBins; ++i) {
+        if (p < kFloor)
+            break;
+
+        tab.push_back(p);
+        p *= r;
+    }
+
+    // Sentinel: a lookup at this index (and past it) returns 0, which
+    // models "decayed to nothing" for interpolation only.
+    tab.push_back(0.0L);
+
+    return tab;
+}
+
+static void accumulate_voice_note(
+    VoiceDiffs& acc,
+    uint64_t ns,
+    uint64_t ne,
+    uint8_t vel,
+    uint64_t bin_us,
+    long double tau_us,
+    std::vector<int64_t>* impulse_diff = nullptr,
+    const std::vector<long double>* decay_tab = nullptr
+) {
+    uint64_t note_end = (ne > ns) ? ne : (ns + 1);
+
+    size_t a_bin = static_cast<size_t>(ns / bin_us);
+
+    size_t b_bin =
+        static_cast<size_t>(
+            (note_end + bin_us - 1) / bin_us
+        );
+
+    if (b_bin <= a_bin)
+        b_bin = a_bin + 1;
+
+    if (acc.count_diff.size() <= b_bin)
+        acc.count_diff.resize(b_bin + 1, 0);
+
+    if (acc.energy_diff.size() <= b_bin)
+        acc.energy_diff.resize(b_bin + 1, 0);
+
+    acc.count_diff[a_bin] += 1;
+    acc.count_diff[b_bin] -= 1;
+
+    int64_t level =
+        static_cast<int64_t>(vel) * ENERGY_SCALE;
+
+    acc.energy_diff[a_bin] += level;
+
+    // Level still remaining at note-off: the damper stops the string,
+    // so the note stops contributing to the ambient level here even
+    // though the exponential model lets its rendered tail (in
+    // energy[]) keep decaying. With a decay table this is a table
+    // lookup plus one linear interpolation instead of std::exp.
+    long double remaining;
+
+    if (decay_tab && !decay_tab->empty() && bin_us > 0) {
+        const uint64_t dur = note_end - ns;
+        const size_t k = static_cast<size_t>(dur / bin_us);
+        const uint64_t frac_us = dur % bin_us;
+
+        const long double d0 =
+            k < decay_tab->size() ? (*decay_tab)[k] : 0.0L;
+        const long double d1 =
+            (k + 1) < decay_tab->size() ? (*decay_tab)[k + 1] : 0.0L;
+
+        const long double frac =
+            static_cast<long double>(frac_us) /
+            static_cast<long double>(bin_us);
+
+        remaining =
+            static_cast<long double>(level) *
+            (d0 + (d1 - d0) * frac);
+    } else {
+        remaining =
+            static_cast<long double>(level) *
+            std::exp(
+                -static_cast<long double>(note_end - ns) /
+                tau_us
+            );
+    }
+
+    acc.energy_diff[b_bin] -= static_cast<int64_t>(remaining);
+
+    if (impulse_diff) {
+        if (impulse_diff->size() <= a_bin)
+            impulse_diff->resize(a_bin + 1, 0);
+
+        (*impulse_diff)[a_bin] += level;
+    }
+}
+
+// Per-kept-note accumulation for the rescue pass: the voice-model
+// diffs plus the impulse diff (share-test energy curve) and the
+// significant-voice contrib diff (polyphony damping) for the same
+// note, mirroring Phase 2a's note_cb exactly. sig_bins must be
+// significant_voice_bins(bin_us, tau_us) for the post curves.
+static void accumulate_kept_note(
+    KeptAccum& acc,
+    uint64_t ns,
+    uint64_t ne,
+    uint8_t vel,
+    uint64_t bin_us,
+    long double tau_us,
+    size_t sig_bins,
+    const std::vector<long double>* decay_tab = nullptr
+) {
+    size_t a_bin = static_cast<size_t>(ns / bin_us);
+    size_t c_end = a_bin + sig_bins;
+
+    if (acc.contrib_diff.size() <= c_end)
+        acc.contrib_diff.resize(c_end + 1, 0);
+
+    acc.contrib_diff[a_bin] += 1;
+    acc.contrib_diff[c_end] -= 1;
+
+    accumulate_voice_note(
+        acc.voices,
+        ns,
+        ne,
+        vel,
+        bin_us,
+        tau_us,
+        &acc.impulse_diff,
+        decay_tab
+    );
+}
+
+static void merge_kept_into(
+    KeptAccum& dst,
+    const KeptAccum& src
+) {
+    if (src.impulse_diff.size() > dst.impulse_diff.size())
+        dst.impulse_diff.resize(src.impulse_diff.size(), 0);
+
+    for (size_t i = 0; i < src.impulse_diff.size(); ++i)
+        dst.impulse_diff[i] += src.impulse_diff[i];
+
+    if (src.contrib_diff.size() > dst.contrib_diff.size())
+        dst.contrib_diff.resize(src.contrib_diff.size(), 0);
+
+    for (size_t i = 0; i < src.contrib_diff.size(); ++i)
+        dst.contrib_diff[i] += src.contrib_diff[i];
+
+    if (src.voices.count_diff.size() > dst.voices.count_diff.size())
+        dst.voices.count_diff.resize(src.voices.count_diff.size(), 0);
+
+    for (size_t i = 0; i < src.voices.count_diff.size(); ++i)
+        dst.voices.count_diff[i] += src.voices.count_diff[i];
+
+    if (src.voices.energy_diff.size() > dst.voices.energy_diff.size())
+        dst.voices.energy_diff.resize(src.voices.energy_diff.size(), 0);
+
+    for (size_t i = 0; i < src.voices.energy_diff.size(); ++i)
+        dst.voices.energy_diff[i] += src.voices.energy_diff[i];
+}
+
 // Build energy[]/prefix[] for the exponential model: the sum of every
 // voice's exponentially-decayed velocity, damped where the number of
 // still-significant voices exceeds the synth's polyphony cap. The
@@ -1303,9 +1750,6 @@ static void build_voice_model_curves(
     int64_t count_running = 0;
     long double level_running = 0.0L;
 
-    std::vector<double> ambient_samples;
-    ambient_samples.reserve(bins);
-
     for (size_t i = 0; i < bins; ++i) {
         count_running += held_count_diff[i];
 
@@ -1333,6 +1777,92 @@ static void build_voice_model_curves(
         gs.held_energy_prefix[i + 1] =
             gs.held_energy_prefix[i] +
             static_cast<long double>(gs.held_energy[i]) * bin_us_ld;
+    }
+
+    constexpr size_t kSmoothBins = 2; // +-100ms at the default 50ms bin
+
+    if (kSmoothBins > 0 && bins > 2 * kSmoothBins + 1) {
+        // Box smooth over a (2*k+1)-bin window, in place. The old
+        // version built four full-size temporaries (two long double
+        // prefix arrays plus two output arrays); this keeps only a
+        // 2*k+1 ring of the original values, because overwriting
+        // held_energy[i] would otherwise corrupt the windows of the
+        // next k iterations, which still need bin i's original value.
+        //
+        // Numerically identical to the prefix-array version: the
+        // window sums add and subtract the same integer originals in
+        // long double, which represents every intermediate exactly.
+        constexpr size_t W = 2 * kSmoothBins + 1;
+
+        std::array<int64_t, W> ring_e{};
+        std::array<int64_t, W> ring_c{};
+
+        size_t lo = 0;
+        size_t hi = 0;
+
+        long double sum_e = 0.0L;
+        long double sum_c = 0.0L;
+
+        for (size_t i = 0; i < bins; ++i) {
+            const size_t nlo =
+                i > kSmoothBins ? i - kSmoothBins : 0;
+            const size_t nhi =
+                std::min(bins, i + kSmoothBins + 1);
+
+            // Drop the leaving element FIRST. Index m leaves at
+            // iteration m+k+1 - the same iteration whose window-front
+            // advance below saves index m+W into ring slot m%W. Doing
+            // the subtraction before that save is what keeps the ring
+            // consistent; the reverse order would read the wrong bin.
+            while (lo < nlo) {
+                sum_e -= static_cast<long double>(ring_e[lo % W]);
+                sum_c -= static_cast<long double>(ring_c[lo % W]);
+                ++lo;
+            }
+
+            while (hi < nhi) {
+                ring_e[hi % W] = gs.held_energy[hi];
+                ring_c[hi % W] = gs.held_count[hi];
+                sum_e += static_cast<long double>(ring_e[hi % W]);
+                sum_c += static_cast<long double>(ring_c[hi % W]);
+                ++hi;
+            }
+
+            const long double span =
+                static_cast<long double>(hi - lo);
+
+            long double e = sum_e / span;
+            long double c = sum_c / span;
+
+            if (e < 0.0L)
+                e = 0.0L;
+
+            if (e > static_cast<long double>(
+                std::numeric_limits<int64_t>::max()))
+                e = static_cast<long double>(
+                    std::numeric_limits<int64_t>::max());
+
+            gs.held_energy[i] = static_cast<int64_t>(e);
+            gs.held_count[i] = static_cast<int64_t>(c + 0.5L);
+        }
+    }
+
+    // Rebuild the prefix integrals and the ambient anchor from the
+    // smoothed curves so every consumer sees one consistent model.
+    gs.held_count_prefix.assign(bins + 1, 0.0L);
+    gs.held_energy_prefix.assign(bins + 1, 0.0L);
+
+    std::vector<double> ambient_samples;
+    ambient_samples.reserve(bins);
+
+    for (size_t i = 0; i < bins; ++i) {
+        gs.held_count_prefix[i + 1] =
+            gs.held_count_prefix[i] +
+            static_cast<long double>(gs.held_count[i]) * bin_us_ld;
+
+        gs.held_energy_prefix[i + 1] =
+            gs.held_energy_prefix[i] +
+            static_cast<long double>(gs.held_energy[i]) * bin_us_ld;
 
         if (gs.held_count[i] > 0) {
             ambient_samples.push_back(
@@ -1342,7 +1872,6 @@ static void build_voice_model_curves(
             );
         }
     }
-
     if (!ambient_samples.empty()) {
         size_t idx = static_cast<size_t>(
             static_cast<double>(ambient_samples.size() - 1) * 0.80
@@ -1356,6 +1885,95 @@ static void build_voice_model_curves(
 
         gs.ambient_typical = ambient_samples[idx];
     }
+}
+
+// Build the crash-leniency curve: an asymmetric (attack/release)
+// envelope follower over the per-bin ambient level, in the same
+// spirit as a compressor's detector. The desired signal is 1 while
+// the ambient is at crash height (>= kCrashRef * the file's typical
+// level) and 0 otherwise; the state rises fast (a crash is
+// recognized within a few bins) and decays slowly, so segments in
+// the seconds after a crash are granted grace even after the held
+// tail itself has decayed away. O(bins), built once at the end of
+// Phase 2a; read-only O(1) lookups from the parallel Phase 2b.
+static void build_leniency_curve(GlobalStats& gs) {
+    const size_t bins = gs.held_energy.size();
+
+    gs.leniency.assign(bins, 0.0f);
+
+    if (bins == 0 || gs.ambient_typical <= 0.0)
+        return;
+
+    constexpr double kCrashRef = 2.0;       // ambient >= 2x typical = crash
+    constexpr double kAttackPerBin = 0.5;   // ~full within 250ms
+    constexpr double kReleasePerBin = 0.02; // ~7.5s linger down to 0.05
+
+    const double crash_ref = kCrashRef * gs.ambient_typical;
+
+    double state = 0.0;
+
+    for (size_t i = 0; i < bins; ++i) {
+        const double ambient =
+            gs.held_count[i] > 0
+                ? static_cast<double>(gs.held_energy[i]) /
+                  static_cast<double>(gs.held_count[i]) /
+                  static_cast<double>(ENERGY_SCALE)
+                : 0.0;
+
+        const double desired = ambient >= crash_ref ? 1.0 : 0.0;
+
+        if (desired > state)
+            state += kAttackPerBin * (desired - state);
+        else
+            state += kReleasePerBin * (desired - state);
+
+        gs.leniency[i] = static_cast<float>(state);
+    }
+}
+
+// Build the rescue pass's post-filter GlobalStats from exactly the
+// notes pass 1 kept. Same three curve builds as Phase 2a, run on the
+// kept-only diffs: voice model (+ ambient_typical anchor), leniency
+// on the post curves (so the re-run keeps post-crash grace instead
+// of silently going stricter), and the damped share-test energy
+// curve. One O(bins) build, no extra scanning.
+static void build_post_stats(
+    GlobalStats& post,
+    KeptAccum& acc,
+    uint64_t bin_us,
+    long double tau_us,
+    const Config& cfg
+) {
+    post.bin_us = bin_us > 0 ? bin_us : 50000ULL;
+    post.diff = std::move(acc.impulse_diff);
+
+    build_voice_model_curves(
+        post,
+        acc.voices.count_diff,
+        acc.voices.energy_diff,
+        tau_us
+    );
+
+    build_leniency_curve(post);
+
+    size_t damped_bins = 0;
+
+    build_energy_exponential_capped(
+        post,
+        acc.contrib_diff,
+        cfg.global_polyphony_cap,
+        tau_us,
+        damped_bins
+    );
+
+    std::printf(
+        "[Rescue] Post-filter curves: %zu bins, ambient p80=%.1f, "
+        "damped bins=%zu\n",
+        post.diff.size(),
+        post.ambient_typical,
+        damped_bins
+    );
+    fflush(stdout);
 }
 
 static long double select_tau_us(const Config& cfg) {
@@ -1599,6 +2217,12 @@ void GlobalStats::build_from_scan(
     long double model_tau_us = select_tau_us(cfg);
     const size_t sig_bins = significant_voice_bins(bin_us, model_tau_us);
 
+    // Shared decay lookup table for the held-voice model: replaces one
+    // std::exp per note with a table lookup + linear interpolation.
+    // Read-only across all scan workers.
+    const std::vector<long double> voice_decay_tab =
+        build_decay_table(bin_us, model_tau_us);
+
     // Pre-scan the track chunk headers so workers can jump straight
     // to a track by index. Same validity rules as a sequential walk:
     // stop at the first non-MTrk chunk or truncated track.
@@ -1645,8 +2269,7 @@ void GlobalStats::build_from_scan(
     struct ScanAccum {
         std::vector<int64_t> diff;
         std::vector<int64_t> contrib_diff;
-        std::vector<int64_t> poly_diff;
-        std::vector<int64_t> held_energy_diff;
+        VoiceDiffs voices;
     };
 
     std::vector<ScanAccum> accums(worker_count(cfg.threads));
@@ -1661,71 +2284,29 @@ void GlobalStats::build_from_scan(
         // Note callback: inject a decay impulse at note-on into the
         // worker's diff array, and accumulate the envelope-independent
         // voice-model curves (held voice count and summed decayed
-        // level of held voices).
+        // level of held voices) via the shared per-note helper.
         auto note_cb = [&](uint64_t ns, uint64_t ne, uint8_t vel) {
-            // Impulse at note-on; the decay recurrence in the build
-            // step handles the tail, so no per-note structure is
-            // retained here (the previous top-K kept one set node per
-            // note alive for the whole run).
-            {
-                size_t a_bin =
-                    static_cast<size_t>(ns / bin_us);
-
-                if (acc.diff.size() <= a_bin)
-                    acc.diff.resize(a_bin + 1, 0);
-
-                acc.diff[a_bin] +=
-                    static_cast<int64_t>(vel) * ENERGY_SCALE;
-
-                size_t c_end = a_bin + sig_bins;
-
-                if (acc.contrib_diff.size() <= c_end)
-                    acc.contrib_diff.resize(c_end + 1, 0);
-
-                acc.contrib_diff[a_bin] += 1;
-                acc.contrib_diff[c_end] -= 1;
-            }
-
-            uint64_t note_end = (ne > ns) ? ne : (ns + 1);
-
             size_t a_bin =
                 static_cast<size_t>(ns / bin_us);
 
-            size_t b_bin =
-                static_cast<size_t>(
-                    (note_end + bin_us - 1) / bin_us
-                );
+            size_t c_end = a_bin + sig_bins;
 
-            if (b_bin <= a_bin)
-                b_bin = a_bin + 1;
+            if (acc.contrib_diff.size() <= c_end)
+                acc.contrib_diff.resize(c_end + 1, 0);
 
-            if (acc.poly_diff.size() <= b_bin)
-                acc.poly_diff.resize(b_bin + 1, 0);
+            acc.contrib_diff[a_bin] += 1;
+            acc.contrib_diff[c_end] -= 1;
 
-            if (acc.held_energy_diff.size() <= b_bin)
-                acc.held_energy_diff.resize(b_bin + 1, 0);
-
-            acc.poly_diff[a_bin] += 1;
-            acc.poly_diff[b_bin] -= 1;
-
-            int64_t level =
-                static_cast<int64_t>(vel) * ENERGY_SCALE;
-
-            acc.held_energy_diff[a_bin] += level;
-
-            // Level still remaining at note-off: the damper stops the
-            // string, so the note stops contributing to the ambient
-            // level here even though the exponential model lets its
-            // rendered tail (in energy[]) keep decaying.
-            long double remaining =
-                static_cast<long double>(level) *
-                std::exp(
-                    -static_cast<long double>(note_end - ns) /
-                    model_tau_us
-                );
-
-            acc.held_energy_diff[b_bin] -=
-                static_cast<int64_t>(remaining);
+            accumulate_voice_note(
+                acc.voices,
+                ns,
+                ne,
+                vel,
+                bin_us,
+                model_tau_us,
+                &acc.diff,
+                &voice_decay_tab
+            );
         };
 
         try {
@@ -1772,8 +2353,8 @@ void GlobalStats::build_from_scan(
     for (const auto& acc : accums) {
         merge_into(diff, acc.diff);
         merge_into(contrib_diff, acc.contrib_diff);
-        merge_into(poly_diff, acc.poly_diff);
-        merge_into(held_energy_diff, acc.held_energy_diff);
+        merge_into(poly_diff, acc.voices.count_diff);
+        merge_into(held_energy_diff, acc.voices.energy_diff);
     }
 
     if (scan_aborted.load()) {
@@ -1816,6 +2397,8 @@ void GlobalStats::build_from_scan(
         static_cast<long long>(max_poly_observed)
     );
     fflush(stdout);
+    
+    build_leniency_curve(*this);
 
     size_t damped_bins = 0;
 
@@ -1895,12 +2478,17 @@ static bool segment_is_bimodal(
         int gap = right_first - left_last - 1;
 
         best_gap = std::max(best_gap, gap);
+
+        // Bimodality is decided by "is there a gap of >= 2 empty bins",
+        // so once any split reaches it the answer is already true.
+        if (best_gap >= 2)
+            return true;
     }
 
-    return best_gap >= 2;
+    return false;
 }
 
-static void cluster_segment(
+static size_t cluster_segment(
     Segment& seg,
     TrackInfo& track,
     std::vector<Note>& notes
@@ -1908,11 +2496,11 @@ static void cluster_segment(
     const size_t count = seg.end - seg.begin;
 
     if (count == 0)
-        return;
+        return 0;
 
     if (count == 1) {
         notes[track.order[seg.begin]].keep = true;
-        return;
+        return 1;
     }
 
     struct F {
@@ -1921,7 +2509,19 @@ static void cluster_segment(
         double p;
     };
 
-    std::vector<F> features(count);
+    std::vector<F> features;
+
+    // Small segments (the overwhelming majority) use a stack buffer so
+    // no heap allocation happens on the Cluster path; only large
+    // segments spill to the heap.
+    constexpr size_t kStackFeat = 256;
+    F stack_feat[kStackFeat];
+    F* features_p = stack_feat;
+
+    if (count > kStackFeat) {
+        features.resize(count);
+        features_p = features.data();
+    }
 
     double mv = 0;
     double md = 0;
@@ -1936,15 +2536,15 @@ static void cluster_segment(
                 n.end_us - n.start_us
             ) / 1000.0;
 
-        features[i] = {
+        features_p[i] = {
             n.velocity / 127.0,
             std::min(duration_ms, 2000.0) / 2000.0,
             n.pitch / 127.0
         };
 
-        mv += features[i].v;
-        md += features[i].d;
-        mp += features[i].p;
+        mv += features_p[i].v;
+        md += features_p[i].d;
+        mp += features_p[i].p;
     }
 
     mv /= count;
@@ -1955,7 +2555,8 @@ static void cluster_segment(
     double sd = 0;
     double sp = 0;
 
-    for (const auto& f : features) {
+    for (size_t i = 0; i < count; ++i) {
+        const F& f = features_p[i];
         sv += (f.v - mv) * (f.v - mv);
         sd += (f.d - md) * (f.d - md);
         sp += (f.p - mp) * (f.p - mp);
@@ -1983,22 +2584,32 @@ static void cluster_segment(
     size_t imax = 0;
 
     for (size_t i = 1; i < count; ++i) {
-        if (features[i].v < features[imin].v)
+        if (features_p[i].v < features_p[imin].v)
             imin = i;
 
-        if (features[i].v > features[imax].v)
+        if (features_p[i].v > features_p[imax].v)
             imax = i;
     }
 
-    c[0][0] = (features[imin].v - mv) / sv;
-    c[0][1] = (features[imin].d - md) / sd;
-    c[0][2] = (features[imin].p - mp) / sp;
+    c[0][0] = (features_p[imin].v - mv) / sv;
+    c[0][1] = (features_p[imin].d - md) / sd;
+    c[0][2] = (features_p[imin].p - mp) / sp;
 
-    c[1][0] = (features[imax].v - mv) / sv;
-    c[1][1] = (features[imax].d - md) / sd;
-    c[1][2] = (features[imax].p - mp) / sp;
+    c[1][0] = (features_p[imax].v - mv) / sv;
+    c[1][1] = (features_p[imax].d - md) / sd;
+    c[1][2] = (features_p[imax].p - mp) / sp;
 
-    std::vector<uint8_t> assignment(count, 0);
+    // Small assignment arrays live on the stack; only large Cluster
+    // segments spill to the heap.
+    constexpr size_t kStackAssign = 256;
+    uint8_t stack_assign[kStackAssign] = {};
+    std::vector<uint8_t> heap_assign;
+    uint8_t* assignment = stack_assign;
+
+    if (count > kStackAssign) {
+        heap_assign.assign(count, 0);
+        assignment = heap_assign.data();
+    }
 
     for (int iter = 0; iter < 6; ++iter) {
         double sums[2][3] = {};
@@ -2006,11 +2617,11 @@ static void cluster_segment(
 
         for (size_t i = 0; i < count; ++i) {
             double z0 =
-                (features[i].v - mv) / sv;
+                (features_p[i].v - mv) / sv;
             double z1 =
-                (features[i].d - md) / sd;
+                (features_p[i].d - md) / sd;
             double z2 =
-                (features[i].p - mp) / sp;
+                (features_p[i].p - mp) / sp;
 
             double d0 =
                 (z0 - c[0][0]) * (z0 - c[0][0]) +
@@ -2044,10 +2655,16 @@ static void cluster_segment(
     int high_cluster =
         (c[1][0] >= c[0][0]) ? 1 : 0;
 
+    size_t kept = 0;
+
     for (size_t i = 0; i < count; ++i) {
-        if (assignment[i] == high_cluster)
+        if (assignment[i] == high_cluster) {
             notes[track.order[seg.begin + i]].keep = true;
+            ++kept;
+        }
     }
+
+    return kept;
 }
 
 static void build_track_segments(
@@ -2056,7 +2673,16 @@ static void build_track_segments(
     const GlobalStats& global_stats,
     const TempoMap& tempo,
     const MeasureMap& measure_map,
-    const Config& cfg
+    const Config& cfg,
+    // Pass 1 of the rescue second pass passes a per-worker
+    // accumulator here: kept notes feed the post-filter ambient, and
+    // near-miss Drop segments flag the track. Pass 2 passes nullptr
+    // (re-runs neither re-flag nor pollute the already-built curves).
+    KeptAccum* kept_acc = nullptr,
+    // When non-null, filled with per-mechanism note counts for the
+    // decision breakdown. Pass 1 fills this; the rescue pass passes
+    // nullptr (stats are reported for the original pass only).
+    SegmentStats* track_stats_out = nullptr
 ) {
     track.segments.clear();
 
@@ -2111,9 +2737,12 @@ static void build_track_segments(
     // tempo map is strictly increasing), so the search stops as soon
     // as a candidate is at least twice the target: the optimum is
     // then bracketed.
-    const long double target_us =
-        std::max(1000.0L,
-                 static_cast<long double>(cfg.segment_seconds) * 1.0e6L);
+    // double throughout: boundary ticks are exact in double (<< 2^53)
+    // and the score comparison needs no extra precision, so the x87
+    // long double path only slowed the search down.
+    const double target_us =
+        std::max(1000.0,
+                 static_cast<double>(cfg.segment_seconds) * 1.0e6);
 
     const int snap_divisions =
         std::clamp(cfg.snap_divisions, 0, 20);
@@ -2161,7 +2790,7 @@ static void build_track_segments(
 
         bool have_best = false;
         uint64_t best_tick = 0;
-        long double best_score = 0.0L;
+        double best_score = 0.0;
 
         for (int m = 0; m <= 40; ++m) {
             // Guard against overflow in the dyadic step.
@@ -2179,11 +2808,11 @@ static void build_track_segments(
 
             uint64_t cand_us = tempo.tick_to_us(cand_tick);
 
-            long double dur =
-                static_cast<long double>(cand_us) -
-                static_cast<long double>(prev_us);
+            double dur =
+                static_cast<double>(cand_us) -
+                static_cast<double>(prev_us);
 
-            long double score =
+            double score =
                 dur > target_us ? dur - target_us : target_us - dur;
 
             if (!have_best || score < best_score) {
@@ -2195,7 +2824,7 @@ static void build_track_segments(
             // Candidates only grow, and the tempo map is strictly
             // increasing, so once a candidate is at least twice the
             // target the optimum is bracketed.
-            if (dur >= 2.0L * target_us)
+            if (dur >= 2.0 * target_us)
                 break;
         }
 
@@ -2208,6 +2837,56 @@ static void build_track_segments(
     }
 
     boundaries.push_back(tempo.tick_to_us(last_tick));
+
+    // Schmitt-trigger state: whether the previous segment (in this
+    // track's time order) was kept. Local to this track, so it is
+    // safe under the Phase 2b per-track parallelism.
+    bool prev_kept = false;
+
+    // Shared decay model for the per-segment audibility math below:
+    // r, one_minus_r, and k_floor depend only on (bin_us, tau), which
+    // are constant for the whole run, so they - and the rpow power
+    // table - are hoisted out of the segment loop instead of being
+    // recomputed (and heap-allocated) per segment. The table carries
+    // k_floor + 2 entries with a zero sentinel: head lookups past
+    // k_floor return 0, which the existing head > 1e-4 check discards
+    // anyway, and a tail exponent span >= k_floor means r^span < 1e-4
+    // (treated as fully decayed - sub-model-noise vs. the exact
+    // geometric tail).
+    const uint64_t shared_bin_us =
+        global_stats.bin_us > 0 ? global_stats.bin_us : 50000ULL;
+
+    const long double shared_tau =
+        global_stats.voice_tau_us > 0.0L
+            ? global_stats.voice_tau_us
+            : 1.0L;
+
+    const long double shared_r =
+        std::exp(
+            -static_cast<long double>(shared_bin_us) / shared_tau
+        );
+
+    const long double shared_one_minus_r = 1.0L - shared_r;
+
+    size_t shared_k_floor = 0;
+    {
+        long double p = 1.0L;
+        while (shared_k_floor < 4096 && p > 1e-4L) {
+            p *= shared_r;
+            ++shared_k_floor;
+        }
+    }
+
+    std::vector<long double> shared_rpow(shared_k_floor + 2);
+    shared_rpow[0] = 1.0L;
+    for (size_t k = 1; k < shared_rpow.size(); ++k)
+        shared_rpow[k] = shared_rpow[k - 1] * shared_r;
+
+    // Raw per-track velocity stats, accumulated during the segment
+    // note loops below so no second full pass over the notes array is
+    // needed at the end.
+    uint64_t raw_velocity_sum = 0;
+    uint8_t raw_max_velocity = 0;
 
     size_t pos = 0;
 
@@ -2244,6 +2923,12 @@ static void build_track_segments(
             double v = n.velocity;
 
             sum += v;
+
+            // Raw track stats (item: fold into this existing pass
+            // instead of walking the notes array a second time).
+            raw_velocity_sum += n.velocity;
+            if (n.velocity > raw_max_velocity)
+                raw_max_velocity = n.velocity;
 
             seg.max_velocity =
                 std::max(
@@ -2373,41 +3058,11 @@ static void build_track_segments(
         // global curves so the subtraction below is consistent. Each
         // note contributes velocity * r^(bin - onset_bin) for every bin
         // it is held, summed in closed form as a geometric series.
-        const long double model_tau =
-            global_stats.voice_tau_us > 0.0L
-                ? global_stats.voice_tau_us
-                : 1.0L;
-
-        const long double r =
-            std::exp(
-                -static_cast<long double>(voice_bin_us) / model_tau
-            );
-
-        const long double one_minus_r = 1.0L - r;
-
-        // Precomputed powers of r for the per-note geometric series
-        // below: tail exponents are bounded by the window length, and
-        // head exponents only matter up to the point where the level
-        // has decayed below 1e-4 of onset (beyond that the note
-        // contributes nothing anyway), so a small table replaces two
-        // std::exp calls per note on files with hundreds of millions
-        // of notes.
-        size_t k_floor = 0;
-        {
-            long double p = 1.0L;
-            while (k_floor < 4096 && p > 1e-4L) {
-                p *= r;
-                ++k_floor;
-            }
-        }
-
-        const size_t rpow_size =
-            std::max(k_floor, win_bins) + 2;
-
-        std::vector<long double> rpow(rpow_size);
-        rpow[0] = 1.0L;
-        for (size_t k = 1; k < rpow_size; ++k)
-            rpow[k] = rpow[k - 1] * r;
+        // model_tau / r / one_minus_r / k_floor / rpow are hoisted out
+        // of this loop (see the shared decay-model block above): they
+        // depend only on (voice_bin_us, tau), constant for the run.
+        // win_bins below stays per-segment; the shared table's
+        // sentinel handles any span beyond k_floor.
 
         long double own_level_sum = 0.0L; // velocity * bins
         uint64_t own_count_sum = 0;       // bins
@@ -2434,7 +3089,7 @@ static void build_track_segments(
 
             long double geom = 0.0L;
 
-            if (one_minus_r < 1e-9L) {
+            if (shared_one_minus_r < 1e-9L) {
                 geom = static_cast<long double>(span);
             } else {
                 // Voices that started long before the window have
@@ -2443,14 +3098,21 @@ static void build_track_segments(
                 long double head = 1.0L;
                 if (cb0 > ob) {
                     size_t hk = cb0 - ob;
-                    head = hk < rpow_size ? rpow[hk] : 0.0L;
+                    head = hk < shared_rpow.size()
+                        ? shared_rpow[hk]
+                        : 0.0L;
                 }
 
                 if (head > 1e-4L) {
-                    long double tail = rpow[span];
+                    // span past the table floor means r^span < 1e-4;
+                    // the sentinel treats it as a fully-decayed tail.
+                    long double tail =
+                        span < shared_rpow.size()
+                            ? shared_rpow[span]
+                            : 0.0L;
 
                     geom = head *
-                        (1.0L - tail) / one_minus_r;
+                        (1.0L - tail) / shared_one_minus_r;
                 }
             }
 
@@ -2555,7 +3217,31 @@ static void build_track_segments(
         seg.own_level = own_level;
         seg.ambient_level = ambient_local;
         seg.audibility_ratio = audibility_ratio;
+
         
+        // Schmitt trigger on the ratio statistic: crossing the normal
+        // threshold turns a segment kept, but a kept segment only
+        // falls back once the ratio sinks below the back-off
+        // threshold. Between the two, the previous decision stands,
+        // which stops borderline segments flickering on curve noise.
+        constexpr double kHysteresisBackoff = 0.6;
+        double ratio_threshold = cfg.audibility_ratio;
+        if (prev_kept)
+            ratio_threshold *= kHysteresisBackoff;
+        
+        // Crash leniency: while the latch is high, the ratio
+        // threshold is relaxed and the low-band gate opens, granting
+        // the same grace a realtime synth's voice stealing grants to
+        // content in the seconds after a crash.
+        const double leniency = global_stats.leniency_at(seg.start_us);
+
+        const double leniency_relief = 1.0 - 0.5 * leniency;
+
+        // Effective ratio bar for this segment (mid band; the low
+        // band applies 1.75x this). Stored on the segment so the
+        // rescue pass can find Drops that only just missed it.
+        seg.ratio_bar = ratio_threshold * leniency_relief;
+
         // Dense percussive/"crash-like" passages are not classified
         // as a special case any more: a loud one lands in the high
         // band and is kept, a quiet uniform one lands in the low
@@ -2595,6 +3281,7 @@ static void build_track_segments(
             cfg.high_velocity
         ) {
             seg.mode = Segment::Mode::KeepAll;
+            seg.reason = Segment::DecisionReason::HighBand;
         } else if (
             seg.avg_velocity >=
             cfg.low_velocity
@@ -2602,11 +3289,13 @@ static void build_track_segments(
             if (seg.track_energy_share >=
                 cfg.mask_share) {
                 seg.mode = Segment::Mode::KeepAll;
+                seg.reason = Segment::DecisionReason::MidShare;
             } else if (
                 seg.audibility_ratio >=
-                cfg.audibility_ratio
+                seg.ratio_bar
             ) {
                 seg.mode = Segment::Mode::KeepAll;
+                seg.reason = Segment::DecisionReason::MidRatio;
             } else if (
                 seg.bimodal ||
                 seg.max_velocity >=
@@ -2615,8 +3304,10 @@ static void build_track_segments(
                     cfg.trend_threshold
             ) {
                 seg.mode = Segment::Mode::Cluster;
+                seg.reason = Segment::DecisionReason::MidCluster;
             } else {
                 seg.mode = Segment::Mode::Drop;
+                seg.reason = Segment::DecisionReason::MidDrop;
             }
         } else {
             if (
@@ -2627,6 +3318,7 @@ static void build_track_segments(
                     cfg.trend_threshold
             ) {
                 seg.mode = Segment::Mode::Cluster;
+                seg.reason = Segment::DecisionReason::LowCluster;
             } else {
                 // Bandpass gate on the local ambient intensity: the
                 // notch between "near-silence" and "carrying real
@@ -2641,29 +3333,147 @@ static void build_track_segments(
                 bool context_allows_rescue =
                     global_stats.ambient_typical > 0.0 &&
                     (seg.ambient_level >= gate_ref ||
-                     seg.ambient_level <= silence_ref);
+                     seg.ambient_level <= silence_ref ||
+                    leniency > 0.05);
 
                 if (context_allows_rescue &&
                     seg.audibility_ratio >=
-                        cfg.audibility_ratio * 1.75) {
+                        seg.ratio_bar * 1.75) {
                     seg.mode = Segment::Mode::KeepAll;
+                    seg.reason = Segment::DecisionReason::LowRatio;
+                } else if (!context_allows_rescue) {
+                    seg.mode = Segment::Mode::Drop;
+                    seg.reason = Segment::DecisionReason::LowGateDrop;
                 } else {
                     seg.mode = Segment::Mode::Drop;
+                    seg.reason = Segment::DecisionReason::LowRatioDrop;
                 }
             }
         }
+        // Cluster counts as kept for hysteresis purposes: it keeps
+        // the segment's melodic content.
+        prev_kept = (seg.mode != Segment::Mode::Drop);
 
         track.segments.push_back(seg);
     }
+
+    // Debounce: a verdict isolated in time - a short Drop run
+    // sandwiched between kept segments, or a short kept run between
+    // Drops - is almost always a borderline ratio crossing rather
+    // than a real change in the music. Runs shorter than
+    // kDebounceSeconds are merged into their surrounding context.
+    // Runs are classified binary (Drop vs kept); a Drop run absorbed
+    // into kept context becomes Cluster unless both neighbours are
+    // KeepAll, so the merge never keeps more per note than a full
+    // keep would.
+    {
+        constexpr double kDebounceSeconds = 1.0;
+
+        size_t run_begin = 0;
+
+        while (run_begin < track.segments.size()) {
+            const bool run_dropped =
+                track.segments[run_begin].mode == Segment::Mode::Drop;
+
+            double run_us = 0.0;
+            size_t run_end = run_begin;
+
+            while (
+                run_end < track.segments.size() &&
+                (track.segments[run_end].mode ==
+                 Segment::Mode::Drop) == run_dropped
+            ) {
+                run_us += static_cast<double>(
+                    track.segments[run_end].end_us -
+                    track.segments[run_end].start_us
+                );
+                ++run_end;
+            }
+
+            const bool prev_kept_ctx =
+                run_begin > 0 &&
+                track.segments[run_begin - 1].mode !=
+                    Segment::Mode::Drop;
+
+            const bool next_kept_ctx =
+                run_end < track.segments.size() &&
+                track.segments[run_end].mode !=
+                    Segment::Mode::Drop;
+
+            const bool minority =
+                run_dropped
+                    ? (prev_kept_ctx && next_kept_ctx)
+                    : (!prev_kept_ctx && !next_kept_ctx);
+
+            if (minority && run_us < kDebounceSeconds * 1.0e6) {
+                for (size_t i = run_begin; i < run_end; ++i) {
+                    Segment& s = track.segments[i];
+
+                    if (run_dropped) {
+                        const bool both_keepall =
+                            run_begin > 0 &&
+                            track.segments[run_begin - 1].mode ==
+                                Segment::Mode::KeepAll &&
+                            run_end < track.segments.size() &&
+                            track.segments[run_end].mode ==
+                                Segment::Mode::KeepAll;
+
+                        s.mode = both_keepall
+                            ? Segment::Mode::KeepAll
+                            : Segment::Mode::Cluster;
+                    } else {
+                        s.mode = Segment::Mode::Drop;
+                    }
+                }
+            }
+
+            run_begin = run_end;
+        }
+    }
+
+    // Count notes by decision reason (after debounce, modes are final).
+    SegmentStats local_stats;
+    for (const auto& seg : track.segments) {
+        uint64_t n = seg.end - seg.begin;
+        switch (seg.reason) {
+            case Segment::DecisionReason::HighBand:
+                local_stats.high_band_kept += n; break;
+            case Segment::DecisionReason::MidShare:
+                local_stats.mid_share_kept += n; break;
+            case Segment::DecisionReason::MidRatio:
+                local_stats.mid_ratio_kept += n; break;
+            case Segment::DecisionReason::MidCluster:
+                local_stats.mid_cluster += n; break;
+            case Segment::DecisionReason::MidDrop:
+                local_stats.mid_dropped += n; break;
+            case Segment::DecisionReason::LowRatio:
+                local_stats.low_ratio_kept += n; break;
+            case Segment::DecisionReason::LowCluster:
+                local_stats.low_cluster += n; break;
+            case Segment::DecisionReason::LowGateDrop:
+                local_stats.low_gate_dropped += n; break;
+            case Segment::DecisionReason::LowRatioDrop:
+                local_stats.low_ratio_dropped += n; break;
+            default:
+                break;
+        }
+    }
+
+    if (track_stats_out)
+        *track_stats_out = local_stats;
+
+    size_t kept_total = 0;
 
     for (auto& seg : track.segments) {
         if (seg.mode == Segment::Mode::KeepAll) {
             for (size_t i = seg.begin; i < seg.end; ++i)
                 notes[track.order[i]].keep = true;
+
+            kept_total += seg.end - seg.begin;
         } else if (
             seg.mode == Segment::Mode::Cluster
         ) {
-            cluster_segment(seg, track, notes);
+            kept_total += cluster_segment(seg, track, notes);
         }
 
         if (cfg.verbose) {
@@ -2698,32 +3508,77 @@ static void build_track_segments(
         }
     }
 
-    track.kept_notes = 0;
-    track.raw_average_velocity = 0;
-    track.raw_max_velocity = 0;
+    // Rescue-pass bookkeeping (pass 1 only, kept_acc != nullptr):
+    // flag the track when any final Drop segment only just missed the
+    // ratio bar that was actually applied to it, and accumulate every
+    // kept note into the post-filter diffs so the second-pass ambient
+    // can be built. The check runs after debounce so modes are final;
+    // track 0 (the format 1 conductor) is never deferred.
+    // NOTE: the own-subtraction in the re-run intentionally reuses
+    // the all-notes own sums against the kept-only post ambient. That
+    // over-subtracts for tracks that dropped a lot and biases toward
+    // rescue, which is the desired direction; a kept-only correction
+    // would need per-track curves (O(tracks x bins) memory).
+    if (kept_acc) {
+        for (const auto& s : track.segments) {
+            if (
+                s.mode == Segment::Mode::Drop &&
+                s.ratio_bar > 0.0 &&
+                track.index != 0 &&
+                s.audibility_ratio >=
+                    cfg.rescue_margin * s.ratio_bar
+            ) {
+                track.flagged = true;
+                break;
+            }
+        }
 
-    for (size_t i = track.note_begin;
-         i < track.note_end;
-         ++i) {
-        track.raw_average_velocity +=
-            notes[i].velocity;
+        const uint64_t vbin_us =
+            global_stats.bin_us > 0
+                ? global_stats.bin_us
+                : 50000ULL;
 
-        track.raw_max_velocity =
-            std::max(
-                track.raw_max_velocity,
-                notes[i].velocity
-            );
+        const long double vtau_us =
+            global_stats.voice_tau_us > 0.0L
+                ? global_stats.voice_tau_us
+                : 1.0L;
 
-        if (notes[i].keep)
-            ++track.kept_notes;
+        const size_t vsig_bins =
+            significant_voice_bins(vbin_us, vtau_us);
+
+        const std::vector<long double> kept_decay_tab =
+            build_decay_table(vbin_us, vtau_us);
+
+        for (size_t i = track.note_begin;
+             i < track.note_end;
+             ++i) {
+            if (notes[i].keep)
+                accumulate_kept_note(
+                    *kept_acc,
+                    notes[i].start_us,
+                    notes[i].end_us,
+                    notes[i].velocity,
+                    vbin_us,
+                    vtau_us,
+                    vsig_bins,
+                    &kept_decay_tab
+                );
+        }
     }
 
-    size_t total_notes =
+    // Raw stats were accumulated during the segment note loops and
+    // kept counts during the application loop above, so no second
+    // full pass over the notes array is needed here.
+    track.kept_notes = kept_total;
+    track.raw_max_velocity = raw_max_velocity;
+
+    const size_t total_notes =
         track.note_end - track.note_begin;
 
     if (total_notes)
-        track.raw_average_velocity /=
-            total_notes;
+        track.raw_average_velocity =
+            static_cast<double>(raw_velocity_sum) /
+            static_cast<double>(total_notes);
 }
 
 static bool emit_delta(
@@ -3136,6 +3991,12 @@ static bool analyze_track_into_vector(
             if (ev.kind != EventKind::Channel)
                 return true;
 
+            // Ticks are stored as uint32_t in Note; a tick beyond
+            // 2^32-1 would silently truncate, so reject the track
+            // outright (the caller reports a parse error).
+            if (ev.tick > std::numeric_limits<uint32_t>::max())
+                return false;
+
             uint8_t high =
                 ev.status & 0xF0;
 
@@ -3194,9 +4055,13 @@ static bool analyze_track_into_vector(
 
                 if (id >= 0) {
                     track_notes[id].end_tick =
-                        std::max(
-                            ev.tick,
-                            track_notes[id].start_tick
+                        static_cast<uint32_t>(
+                            std::max(
+                                ev.tick,
+                                static_cast<uint64_t>(
+                                    track_notes[id].start_tick
+                                )
+                            )
                         );
 
                     track_notes[id].end_us =
@@ -3231,9 +4096,13 @@ static bool analyze_track_into_vector(
 
         while (id >= 0) {
             track_notes[id].end_tick =
-                std::max(
-                    track.max_tick,
-                    track_notes[id].start_tick + 1
+                static_cast<uint32_t>(
+                    std::max(
+                        track.max_tick,
+                        static_cast<uint64_t>(
+                            track_notes[id].start_tick
+                        ) + 1
+                    )
                 );
 
             track_notes[id].end_us =
@@ -3349,6 +4218,24 @@ static double process_cpu_ms() {
     ) / 10000.0;
 }
 
+// Peak working set size of this process in MB, as reported by the
+// kernel. This is the high-water mark since process start, not the
+// current snapshot — it only increases, never decreases, so one read
+// at the end gives the true peak.
+static double peak_working_set_mb() {
+    PROCESS_MEMORY_COUNTERS pmc{};
+
+    if (GetProcessMemoryInfo(
+        GetCurrentProcess(),
+        &pmc,
+        sizeof(pmc)
+    ))
+        return static_cast<double>(pmc.PeakWorkingSetSize) /
+               (1024.0 * 1024.0);
+
+    return -1.0;
+}
+
 // Number of worker threads to spawn for the per-track scan phases.
 static unsigned worker_count(int requested) {
     unsigned n =
@@ -3389,14 +4276,73 @@ static void run_workers(int requested, Fn&& fn) {
         t.join();
 }
 
+// Copy [offset, offset+len) from a scratch file handle into the output
+// file handle with a fixed-size buffer: O(1) RAM regardless of file
+// size. Both handles are positioned explicitly, so callers can copy
+// tail records in track order even though flagged tracks were
+// appended to the scratch out of order.
+static bool copy_scratch_range(
+    HANDLE src,
+    HANDLE dst,
+    uint64_t offset,
+    uint64_t len
+) {
+    if (len == 0)
+        return true;
+
+    LARGE_INTEGER pos;
+    pos.QuadPart = static_cast<LONGLONG>(offset);
+
+    if (!SetFilePointerEx(src, pos, nullptr, FILE_BEGIN))
+        return false;
+
+    std::vector<uint8_t> buf(1 << 20);
+
+    uint64_t remaining = len;
+
+    while (remaining > 0) {
+        DWORD want = static_cast<DWORD>(
+            std::min<uint64_t>(remaining, buf.size())
+        );
+
+        DWORD got = 0;
+
+        if (!ReadFile(src, buf.data(), want, &got, nullptr))
+            return false;
+
+        if (got != want)
+            return false;
+
+        const uint8_t* p = buf.data();
+        DWORD left = got;
+
+        while (left > 0) {
+            DWORD done = 0;
+
+            if (!WriteFile(dst, p, left, &done, nullptr))
+                return false;
+
+            if (done == 0)
+                return false;
+
+            p += done;
+            left -= done;
+        }
+
+        remaining -= got;
+    }
+
+    return true;
+}
+
 static void print_usage() {
     std::printf(
         "Usage:\n"
         "  velfilter_smart.exe input.mid output.mid [options]\n"
         "\n"
         "Velocity:\n"
-        "  --low N              low-band cutoff (default 30)\n"
-        "  --high N             high-band cutoff (default 70)\n"
+        "  --low N              low-band cutoff (default 30)\n\n"
+        "  --high N             high-band cutoff (default 70)\n\n"
         "  --peak N             isolated-note rescue threshold (default 100)\n"
         "\n"
         "Segmentation:\n"
@@ -3404,25 +4350,25 @@ static void print_usage() {
         "                       seconds; boundaries snap to dyadic\n"
         "                       divisions/multiples of a measure\n"
         "                       (default 2.0 = one measure at the\n"
-        "                       120 BPM base tempo)\n"
+        "                       120 BPM base tempo)\n\n"
         "  --snap-divisions N   snap grid = measure / 2^N (default 2 =\n"
         "                       quarter-bar; 0 = bar lines only)\n"
         "\n"
         "Masking:\n"
-        "  --mask-share N       minimum MIDI energy share (default 0.01)\n"
+        "  --mask-share N       minimum MIDI audio energy share (default 0.01)\n\n"
         "  --trend-threshold N  rising-velocity tiebreaker for ambiguous\n"
         "                       segments (default 12)\n"
         "\n"
         "Energy / Envelope (single exponential decay model):\n"
-        "  --tau-ms N               tau in ms for the exponential decay\n"
-        "                           model (default 0 = 500)\n"
+        "  --tau-ms N               tau (time taken to decay by 1/e) in ms\n"
+        "                           for the exponential decay model (default 500ms)\n\n"
         "  --global-polyphony-cap N approximate max concurrent audible voices;\n"
         "                           caps the global energy curve to model a\n"
         "                           real synth's voice stealing/limiting, so\n"
-        "                           a dense crash's held/decaying note count\n"
+        "                           a dense crash's held/decaying voice count\n"
         "                           can't inflate the global average past what\n"
-        "                           any real instrument could actually sound\n"
-        "                           at once (default 0, 0 disables damping)\n"
+        "                           the number of voices synths can practically\n"
+        "                           sound at once (default 0, 0 disables damping)\n"
         "\n"
         "Realtime audibility (intensity-relative removal scale):\n"
         "  --audibility-ratio N own mean held-voice level vs the level of the\n"
@@ -3430,25 +4376,28 @@ static void print_usage() {
         "                       segments at or above this fraction are heard\n"
         "                       on a realtime (voice-limited) synth and kept\n"
         "                       even where the rendered mix would bury them\n"
-        "                       (default 1.25, ~+2dB; 0.30 ~-10dB suits\n"
-        "                       sparse files)\n"
+        "                       (default 1.25)\n\n"
         "  --ambient-gate N     low-band rescue gate: the local ambient level\n"
         "                       must reach this fraction of the file's\n"
         "                       typical sounding level before quiet segments\n"
-        "                       are rescued, so art passages dominated by\n"
-        "                       their own quiet notes stay dropped (default\n"
-        "                       1.0)\n"
+        "                       are rescued(default 1.0)\n"
         "\n"
-        "Other:\n"
+        "Second pass for rescue (lossy-filter exposure correction):\n"
+        "  --second-pass             re-decide borderline tracks against the\n"
+        "                            post-filter ambient (default off)\n\n"
+        "  --rescue-margin N         flag a dropped segment's track for rescue\n"
+        "                            when ratio >= N * its ratio bar (default 0.80;\n"
+        "                            lower flags more tracks)\n\n"
+        "  --no-preserve-track-order disable track-order preservation via temporary file\n"
+        "                            (zero extra I/O, smaller memory)\n"
+        "\n"
+        "Others:\n"
         "  --threads N          worker threads for the per-track scan\n"
         "                       phases (default 0 = all hardware\n"
-        "                       threads, output is identical)\n"
-        "  --global-bin-ms N    masking curve resolution (default 50)\n"
-        "  --verbose            print segment decisions\n"
-        "  --no-prefetch        skip the PrefetchVirtualMemory warm-up before\n"
-        "                       Phase 1b (Phase 1b is the first full-file\n"
-        "                       read; the prefetch turns a cold-cache\n"
-        "                       demand-page stall into one sequential read)\n"
+        "                       threads)\n\n"
+        "  --global-bin-ms N    masking curve resolution (default 50ms)\n\n"
+        "  --verbose            print segment decisions\n\n"
+        "  --no-prefetch        skip disk warmup before file read (will slow down cold disk reads massively)\n\n"
         "  --no-global-move     do not consolidate globals into track 0\n"
     );
 }
@@ -3463,6 +4412,8 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     Config cfg;
+
+    bool preserve_explicit = false;
 
     for (int i = 3; i < argc; ++i) {
         const wchar_t* a = argv[i];
@@ -3520,6 +4471,15 @@ int wmain(int argc, wchar_t** argv) {
             if (!need_value(value) ||
                 !parse_number(value, cfg.ambient_gate))
                 return 1;
+        } else if (!_wcsicmp(a, L"--second-pass")) {
+            cfg.second_pass = true;
+        } else if (!_wcsicmp(a, L"--rescue-margin")) {
+            if (!need_value(value) ||
+                !parse_number(value, cfg.rescue_margin))
+                return 1;
+        } else if (!_wcsicmp(a, L"--no-preserve-track-order")) {
+            cfg.preserve_track_order = false;
+            preserve_explicit = true;
         } else if (!_wcsicmp(a, L"--threads")) {
             if (!need_value(value) ||
                 !parse_int(value, cfg.threads))
@@ -3541,6 +4501,19 @@ int wmain(int argc, wchar_t** argv) {
             );
             return 1;
         }
+    }
+
+    if (cfg.rescue_margin <= 0.0 || cfg.rescue_margin > 1.5) {
+        std::printf("Invalid --rescue-margin (expected 0 < N <= 1.5).\n");
+        return 1;
+    }
+
+    if (preserve_explicit && !cfg.second_pass) {
+        std::printf(
+            "Note: track-order preservation only applies with "
+            "--second-pass; ignoring.\n"
+        );
+        fflush(stdout);
     }
 
     MappedFile file;
@@ -3706,12 +4679,19 @@ int wmain(int argc, wchar_t** argv) {
         // slice; the slices are concatenated in track order below and
         // sorted immediately after, so the result is identical to the
         // sequential scan regardless of completion order.
-        std::vector<std::vector<GlobalEvent>> global_parts(track_count);
+        // Per-worker buffers instead of per-track: every event already
+        // carries its track index, and the sort below tiebreaks on
+        // (tick, track, order), so the final order is independent of
+        // which worker collected what. Avoids track_count heap
+        // allocations on huge files.
+        std::vector<std::vector<GlobalEvent>> global_parts(
+            worker_count(cfg.threads)
+        );
         std::atomic<uint32_t> next_track{0};
         std::atomic<bool> scan_failed{false};
         std::atomic<uint32_t> failed_track{0};
 
-        auto globals_worker = [&](unsigned) {
+        auto globals_worker = [&](unsigned wid) {
             try {
                 for (;;) {
                     uint32_t i = next_track.fetch_add(1);
@@ -3722,7 +4702,7 @@ int wmain(int argc, wchar_t** argv) {
                         return;
 
                     TrackInfo& track = tracks[i];
-                    std::vector<GlobalEvent>& part = global_parts[i];
+                    std::vector<GlobalEvent>& part = global_parts[wid];
 
                     bool ok = scan_events(
                         track.data,
@@ -3808,8 +4788,8 @@ int wmain(int argc, wchar_t** argv) {
 
         std::printf(
             "[Phase 1b] completed in %.1fms "
-            "(CPU %.1fms, %.0f%% busy; a low busy%% means the "
-            "time went to disk/AV/cloud, not parsing)\n",
+            "(CPU %.1fms, %.0f%% busy; a low (<100%%) busy%% means the "
+            "time went to waiting for disk, not parsing)\n",
             phase1b_ms,
             cpu_1b_ms,
             phase1b_ms > 0.0
@@ -3879,11 +4859,91 @@ int wmain(int argc, wchar_t** argv) {
 
     size_t total_notes = 0;
     size_t kept_notes = 0;
+    SegmentStats global_stats_acc;
 
     Timer phase2b_timer;
     double cumulative_parse = 0;
     double cumulative_segment = 0;
     double cumulative_write = 0;
+
+    // Rescue second pass (optional, --second-pass): pass-1 decisions
+    // are made against the ORIGINAL ambient. Wherever removal thins
+    // that ambient, borderline Drops become audible in the thinner
+    // output. Flagged tracks (any final Drop that only just missed
+    // its own ratio bar) are re-decided against the post-filter
+    // ambient built from exactly the notes pass 1 kept. Rescue-only:
+    // the post ambient is never louder, so kept segments never flip.
+    const bool use_rescue = cfg.second_pass;
+
+    // Output ordering for deferred tracks (default: preserved via
+    // scratch file; --no-preserve-track-order opts out): with
+    // preservation re-decided tracks go back into their original
+    // position - one early flagged track would otherwise pull every
+    // later clean track out of order. With reorder, clean tracks after
+    // preserve, clean tracks after the first deferred track go to one
+    // scratch file (output path + ".vfscratch") and the tail is
+    // reassembled in track order afterwards: ~2 extra sequential
+    // passes over the tail, O(1) RAM, no paging cliff. Memory
+    // buffering of the whole tail is deliberately not used: one early
+    // flagged track would pin nearly the whole output in RAM.
+    const bool use_scratch = use_rescue && cfg.preserve_track_order;
+
+    KeptAccum rescue_accum;
+
+    struct TailRec {
+        uint32_t track = 0;
+        uint64_t offset = 0;
+        uint64_t len = 0;
+        bool deferred = false;
+    };
+
+    std::vector<TailRec> tail_recs;
+    std::vector<int64_t> tail_pos_by_track;
+    // Pass-1 Drop flags per track, snapshotted at the defer site
+    // (before the segment data is released) so the rescue summary can
+    // report how many segments changed decision. Indexed by track;
+    // empty for non-flagged tracks.
+    std::vector<std::vector<char>> pass1_drop(tracks.size());
+    std::wstring scratch_path;
+    FileWriter scratch;
+    bool scratch_open = false;
+    bool seen_first_flagged = false;
+
+    if (use_scratch) {
+        tail_pos_by_track.assign(tracks.size(), -1);
+        scratch_path = std::wstring(argv[2]) + L".vfscratch";
+    }
+
+    auto ensure_scratch_open = [&]() -> bool {
+        if (scratch_open)
+            return true;
+
+        if (!scratch.open(scratch_path.c_str())) {
+            std::printf("Failed to open scratch file.\n");
+            return false;
+        }
+
+        scratch_open = true;
+        return true;
+    };
+
+    auto cleanup_scratch = [&]() {
+        scratch.close();
+
+        if (!scratch_path.empty())
+            DeleteFileW(scratch_path.c_str());
+    };
+
+    if (use_rescue) {
+        std::printf(
+            "[Rescue] Second pass ON (margin %.2f, %s).\n",
+            cfg.rescue_margin,
+            use_scratch
+                ? "preserve track order via scratch file"
+                : "re-decided tracks append at end"
+        );
+        fflush(stdout);
+    }
 
     // Stage 2 parallelism: parse + segment are pure per-track work
     // (global_stats is read-only here), so tracks are processed in
@@ -3895,6 +4955,7 @@ int wmain(int argc, wchar_t** argv) {
         bool ok = true;
         double parse_ms = 0.0;
         double seg_ms = 0.0;
+        SegmentStats stats;
     };
 
     const size_t parallel_block_size =
@@ -3911,7 +4972,18 @@ int wmain(int argc, wchar_t** argv) {
         std::atomic<size_t> next_job{0};
         std::atomic<bool> job_failed{false};
 
-        auto job_worker = [&](unsigned) {
+        // Per-worker kept-note accumulators (ScanAccum-then-merge, as
+        // in Phase 2a): merged into rescue_accum after the join so no
+        // two threads touch the same diff vectors. Bounded by
+        // workers x bins.
+        std::vector<KeptAccum> worker_accums(
+            use_rescue ? worker_count(cfg.threads) : 0
+        );
+
+        auto job_worker = [&](unsigned wid) {
+            KeptAccum* my_acc =
+                use_rescue ? &worker_accums[wid] : nullptr;
+
             try {
                 for (;;) {
                     size_t i = next_job.fetch_add(1);
@@ -3945,7 +5017,9 @@ int wmain(int argc, wchar_t** argv) {
                             global_stats,
                             tempo,
                             measure_map,
-                            cfg
+                            cfg,
+                            my_acc,
+                            &job.stats
                         );
 
                         job.seg_ms = op_timer.restart_ms();
@@ -3964,7 +5038,16 @@ int wmain(int argc, wchar_t** argv) {
                 block_begin + 1,
                 block_end
             );
+
+            if (use_scratch)
+                cleanup_scratch();
+
             return 1;
+        }
+
+        if (use_rescue) {
+            for (const auto& wa : worker_accums)
+                merge_kept_into(rescue_accum, wa);
         }
 
         for (size_t i = 0; i < block_count; ++i) {
@@ -3977,36 +5060,151 @@ int wmain(int argc, wchar_t** argv) {
 
             if ((t + 1) % 100 == 0 || t == 0) {
                 std::printf(
-                    "  Track %zu/%zu: %zu notes (parse %.1fms)\n",
+                    "  Track %zu/%zu: %zu notes (parse %.1fms)%s\n",
                     t + 1,
                     tracks.size(),
                     job.notes.size(),
-                    job.parse_ms
+                    job.parse_ms,
+                    (use_rescue && tracks[t].flagged)
+                        ? " [deferred]"
+                        : ""
                 );
                 fflush(stdout);
             }
 
-            Timer write_timer;
+            // Deferred tracks are not written in pass 1; their kept
+            // counts are not final yet either. Notes are re-parsed
+            // from the memory-mapped input in the rescue pass, so the
+            // per-block job memory is still freed below.
+            if (use_rescue && tracks[t].flagged) {
+                seen_first_flagged = true;
 
-            if (!write_track(
-                out,
-                tracks[t],
-                job.notes,
-                globals,
-                format,
-                move_globals
-            )) {
-                std::printf(
-                    "Failed while writing track %zu.\n",
-                    t
-                );
-                return 1;
+                if (use_scratch) {
+                    if (!ensure_scratch_open()) {
+                        cleanup_scratch();
+                        return 1;
+                    }
+
+                    tail_pos_by_track[t] =
+                        static_cast<int64_t>(tail_recs.size());
+
+                    tail_recs.push_back(TailRec{
+                        tracks[t].index,
+                        0,
+                        0,
+                        true
+                    });
+                }
+
+                if (cfg.verbose) {
+                    std::printf(
+                        "Track %3zu: notes=%zu DEFERRED "
+                        "(parse=%.1fms seg=%.1fms)\n",
+                        t,
+                        job.notes.size(),
+                        job.parse_ms,
+                        job.seg_ms
+                    );
+                }
+
+                // Snapshot the pass-1 Drop flags before the segment
+                // data is released; the rescue summary compares these
+                // positionally against the re-run's segments.
+                pass1_drop[t].reserve(tracks[t].segments.size());
+                for (const auto& s : tracks[t].segments)
+                    pass1_drop[t].push_back(
+                        s.mode == Segment::Mode::Drop ? 1 : 0
+                    );
+
+                tracks[t].segments.clear();
+                tracks[t].segments.shrink_to_fit();
+                tracks[t].order.clear();
+                tracks[t].order.shrink_to_fit();
+                continue;
             }
 
-            double write_ms = write_timer.elapsed_ms();
-            cumulative_write += write_ms;
+            Timer write_timer;
+            double write_ms = 0.0;
+
+            if (use_scratch && seen_first_flagged) {
+                // Clean track after the first deferred one: its chunk
+                // position depends on deferred sizes still unknown, so
+                // it goes to the scratch file with its offset recorded
+                // for the ordered reassembly.
+                if (!ensure_scratch_open()) {
+                    cleanup_scratch();
+                    return 1;
+                }
+
+                uint64_t off_before = scratch.tell();
+
+                if (off_before == UINT64_MAX ||
+                    !write_track(
+                        scratch,
+                        tracks[t],
+                        job.notes,
+                        globals,
+                        format,
+                        move_globals
+                    )) {
+                    std::printf(
+                        "Failed while writing track %zu to scratch.\n",
+                        t
+                    );
+                    cleanup_scratch();
+                    return 1;
+                }
+
+                uint64_t off_after = scratch.tell();
+
+                if (off_after == UINT64_MAX ||
+                    off_after < off_before) {
+                    std::printf(
+                        "Failed to measure scratch chunk for track %zu.\n",
+                        t
+                    );
+                    cleanup_scratch();
+                    return 1;
+                }
+
+                write_ms = write_timer.elapsed_ms();
+                cumulative_write += write_ms;
+
+                tail_pos_by_track[t] =
+                    static_cast<int64_t>(tail_recs.size());
+
+                tail_recs.push_back(TailRec{
+                    tracks[t].index,
+                    off_before,
+                    off_after - off_before,
+                    false
+                });
+            } else {
+                if (!write_track(
+                    out,
+                    tracks[t],
+                    job.notes,
+                    globals,
+                    format,
+                    move_globals
+                )) {
+                    std::printf(
+                        "Failed while writing track %zu.\n",
+                        t
+                    );
+
+                    if (use_scratch)
+                        cleanup_scratch();
+
+                    return 1;
+                }
+
+                write_ms = write_timer.elapsed_ms();
+                cumulative_write += write_ms;
+            }
 
             kept_notes += tracks[t].kept_notes;
+            global_stats_acc.add(job.stats);
 
             if (cfg.verbose || (t + 1) % 100 == 0 ||
                 (t + 1) == tracks.size()) {
@@ -4028,6 +5226,8 @@ int wmain(int argc, wchar_t** argv) {
 
             // job.notes is freed when the block's jobs vector is
             // destroyed; release the per-track segment data now.
+            // (Deferred tracks were already released at their defer
+            // site above; this path only runs for written tracks.)
             tracks[t].segments.clear();
             tracks[t].segments.shrink_to_fit();
             tracks[t].order.clear();
@@ -4035,7 +5235,418 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
 
-    double total_phase2b_ms = phase2b_timer.elapsed_ms();
+    // ---------------- Rescue post-pass (optional) ----------------
+    // One fixed-point step toward the post-filter ambient, rescue
+    // direction only. Flagged tracks are re-parsed from the
+    // memory-mapped input (TempoCursor makes re-parsing stateless, so
+    // no note data is retained across the gap) and re-decided with
+    // the UNMODIFIED pipeline against the post curves. Only thinned
+    // windows re-decide differently; clear-cut art stays dropped.
+
+    // Wall time up to the rescue (pass 1 only) so the Phase 2b
+    // breakdown reflects pass-1 work; the rescue reports its own
+    // breakdown separately.
+    const double pass1_phase2b_ms = phase2b_timer.elapsed_ms();
+
+    if (use_rescue) {
+        std::vector<uint32_t> flagged_list;
+        flagged_list.reserve(tracks.size());
+
+        for (const auto& tr : tracks) {
+            if (tr.flagged)
+                flagged_list.push_back(tr.index);
+        }
+
+        if (flagged_list.empty()) {
+            std::printf(
+                "[Rescue] No borderline tracks flagged; "
+                "single-pass output stands.\n"
+            );
+            fflush(stdout);
+
+            if (scratch_open)
+                cleanup_scratch();
+        } else {
+            std::printf(
+                "[Rescue] %zu/%zu tracks flagged "
+                "(margin %.2f); rebuilding ambient from kept notes...\n",
+                flagged_list.size(),
+                tracks.size(),
+                cfg.rescue_margin
+            );
+            fflush(stdout);
+
+            // Wall clock for the whole rescue (ambient rebuild +
+            // re-run + write/reassembly), and per-stage accumulators
+            // styled after the Phase 2b breakdown.
+            Timer rescue_timer;
+            double rescue_parse_ms = 0;
+            double rescue_seg_ms = 0;
+            double rescue_write_ms = 0;
+
+            GlobalStats post_stats;
+
+            build_post_stats(
+                post_stats,
+                rescue_accum,
+                global_stats.bin_us,
+                global_stats.voice_tau_us,
+                cfg
+            );
+
+            // Release the merged diffs before the re-run allocates.
+            rescue_accum = KeptAccum();
+
+            // Rescue accounting (summary printed right after the
+            // re-run): pass-1 kept counts and Drop flags are
+            // snapshotted so the re-run's deltas can be reported.
+            // Segment counts are identical between passes (same
+            // notes, deterministic boundaries), so Drop flags compare
+            // positionally.
+            std::vector<size_t> pass1_kept(flagged_list.size());
+
+            size_t rescued_segments_total = 0;
+            size_t rescued_notes_total = 0;
+            size_t rescued_tracks_total = 0;
+
+            for (size_t j = 0; j < flagged_list.size(); ++j)
+                pass1_kept[j] = tracks[flagged_list[j]].kept_notes;
+
+            // Re-run the unmodified pipeline on flagged tracks only,
+            // in bounded blocks so memory stays flat. Cost is
+            // proportional to flagged tracks; honest 2x worst case.
+            for (size_t fb = 0;
+                 fb < flagged_list.size();
+                 fb += parallel_block_size) {
+                const size_t fe = std::min(
+                    flagged_list.size(),
+                    fb + parallel_block_size
+                );
+                const size_t fc = fe - fb;
+
+                std::vector<TrackJob> jobs2(fc);
+                std::atomic<size_t> next2{0};
+                std::atomic<bool> fail2{false};
+
+                auto worker2 = [&](unsigned) {
+                    try {
+                        for (;;) {
+                            size_t i = next2.fetch_add(1);
+
+                            if (i >= fc)
+                                return;
+
+                            uint32_t t = flagged_list[fb + i];
+                            TrackJob& job = jobs2[i];
+                            Timer op;
+
+                            if (!analyze_track_into_vector(
+                                tracks[t],
+                                job.notes,
+                                tempo
+                            )) {
+                                job.ok = false;
+                                fail2.store(
+                                    true,
+                                    std::memory_order_relaxed
+                                );
+                                return;
+                            }
+
+                            job.parse_ms = op.restart_ms();
+
+                            if (job.notes.empty()) {
+                                tracks[t].note_begin = 0;
+                                tracks[t].note_end = 0;
+                            } else {
+                                // nullptr: no re-flag, no curve
+                                // pollution; one iteration only.
+                                build_track_segments(
+                                    tracks[t],
+                                    job.notes,
+                                    post_stats,
+                                    tempo,
+                                    measure_map,
+                                    cfg,
+                                    nullptr
+                                );
+
+                                job.seg_ms = op.restart_ms();
+                            }
+                        }
+                    } catch (...) {
+                        fail2.store(true, std::memory_order_relaxed);
+                    }
+                };
+
+                run_workers(cfg.threads, worker2);
+
+                if (fail2.load()) {
+                    std::printf(
+                        "[Rescue] Failed to re-process flagged tracks.\n"
+                    );
+
+                    if (use_scratch)
+                        cleanup_scratch();
+
+                    return 1;
+                }
+
+                for (size_t i = 0; i < fc; ++i) {
+                    uint32_t t = flagged_list[fb + i];
+                    TrackJob& job = jobs2[i];
+
+                    rescue_parse_ms += job.parse_ms;
+                    rescue_seg_ms += job.seg_ms;
+
+                    Timer wt;
+
+                    if (use_scratch) {
+                        if (!ensure_scratch_open()) {
+                            cleanup_scratch();
+                            return 1;
+                        }
+
+                        uint64_t off_before = scratch.tell();
+
+                        if (off_before == UINT64_MAX ||
+                            !write_track(
+                                scratch,
+                                tracks[t],
+                                job.notes,
+                                globals,
+                                format,
+                                move_globals
+                            )) {
+                            std::printf(
+                                "[Rescue] Failed writing track %u "
+                                "to scratch.\n",
+                                t
+                            );
+                            cleanup_scratch();
+                            return 1;
+                        }
+
+                        uint64_t off_after = scratch.tell();
+
+                        if (off_after == UINT64_MAX ||
+                            off_after < off_before) {
+                            std::printf(
+                                "[Rescue] Failed to measure scratch "
+                                "chunk for track %u.\n",
+                                t
+                            );
+                            cleanup_scratch();
+                            return 1;
+                        }
+
+                        double wms = wt.elapsed_ms();
+                        rescue_write_ms += wms;
+
+                        int64_t pos = tail_pos_by_track[t];
+
+                        if (pos < 0 ||
+                            static_cast<size_t>(pos) >=
+                                tail_recs.size()) {
+                            std::printf(
+                                "[Rescue] Internal error: no tail slot "
+                                "for track %u.\n",
+                                t
+                            );
+                            cleanup_scratch();
+                            return 1;
+                        }
+
+                        tail_recs[pos].offset = off_before;
+                        tail_recs[pos].len =
+                            off_after - off_before;
+                        tail_recs[pos].deferred = false;
+                    } else {
+                        if (!write_track(
+                            out,
+                            tracks[t],
+                            job.notes,
+                            globals,
+                            format,
+                            move_globals
+                        )) {
+                            std::printf(
+                                "[Rescue] Failed while writing "
+                                "track %u.\n",
+                                t
+                            );
+                            return 1;
+                        }
+
+                        rescue_write_ms += wt.elapsed_ms();
+                    }
+
+            kept_notes += tracks[t].kept_notes;
+
+                    std::printf(
+                        "[Rescue] Track %3u re-decided: notes=%zu "
+                        "kept=%zu (parse=%.1fms seg=%.1fms)\n",
+                        t,
+                        job.notes.size(),
+                        tracks[t].kept_notes,
+                        job.parse_ms,
+                        job.seg_ms
+                    );
+                    fflush(stdout);
+
+                    // Delta vs. pass 1: notes the re-run kept beyond
+                    // the pass-1 kept count, and pass-1 Drop segments
+                    // that re-decided to keep/cluster.
+                    size_t rescued_notes = 0;
+                    size_t rescued_segments = 0;
+
+                    const size_t old_kept = pass1_kept[fb + i];
+                    if (tracks[t].kept_notes > old_kept)
+                        rescued_notes =
+                            tracks[t].kept_notes - old_kept;
+
+                    const std::vector<char>& old_drop =
+                        pass1_drop[t];
+                    const size_t nseg =
+                        std::min(
+                            old_drop.size(),
+                            tracks[t].segments.size()
+                        );
+                    for (size_t si = 0; si < nseg; ++si) {
+                        if (old_drop[si] &&
+                            tracks[t].segments[si].mode !=
+                                Segment::Mode::Drop)
+                            ++rescued_segments;
+                    }
+
+                    rescued_segments_total += rescued_segments;
+                    rescued_notes_total += rescued_notes;
+
+                    if (rescued_segments || rescued_notes) {
+                        ++rescued_tracks_total;
+
+                        std::printf(
+                            "[Rescue]   track %3u rescued: "
+                            "%zu segment(s), %zu notes\n",
+                            t,
+                            rescued_segments,
+                            rescued_notes
+                        );
+                        fflush(stdout);
+                    }
+
+                    tracks[t].segments.clear();
+                    tracks[t].segments.shrink_to_fit();
+                    tracks[t].order.clear();
+                    tracks[t].order.shrink_to_fit();
+                }
+            }
+
+            std::printf(
+                "[Rescue] Done: %zu/%zu flagged tracks changed "
+                "decision; %zu segment(s) and %zu notes rescued.\n",
+                rescued_tracks_total,
+                flagged_list.size(),
+                rescued_segments_total,
+                rescued_notes_total
+            );
+            fflush(stdout);
+
+            if (use_scratch) {
+                // Reassemble the tail in track order: tail_recs is
+                // already in track order (pushed sequentially in pass
+                // 1, flagged slots filled above), so this is one
+                // sequential read pass over the scratch plus one
+                // sequential write pass into the final file. O(1) RAM.
+                std::printf(
+                    "[Rescue] Reassembling %zu tail chunks in order...\n",
+                    tail_recs.size()
+                );
+                fflush(stdout);
+
+                scratch.close();
+                scratch_open = false;
+
+                HANDLE hSrc = CreateFileW(
+                    scratch_path.c_str(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL |
+                        FILE_FLAG_SEQUENTIAL_SCAN,
+                    nullptr
+                );
+
+                if (hSrc == INVALID_HANDLE_VALUE) {
+                    std::printf(
+                        "[Rescue] Failed to reopen scratch file.\n"
+                    );
+                    cleanup_scratch();
+                    return 1;
+                }
+
+                for (const auto& rec : tail_recs) {
+                    if (!copy_scratch_range(
+                        hSrc,
+                        out.file,
+                        rec.offset,
+                        rec.len
+                    )) {
+                        std::printf(
+                            "[Rescue] Failed copying tail chunk "
+                            "(track %u).\n",
+                            rec.track
+                        );
+                        CloseHandle(hSrc);
+                        cleanup_scratch();
+                        return 1;
+                    }
+                }
+
+                CloseHandle(hSrc);
+
+                if (!DeleteFileW(scratch_path.c_str())) {
+                    std::printf(
+                        "[Rescue] Warning: could not delete scratch "
+                        "file.\n"
+                    );
+                }
+
+                scratch_path.clear();
+
+                std::printf(
+                    "[Rescue] Tail reassembled in order.\n"
+                );
+                fflush(stdout);
+            } else {
+                std::printf(
+                    "[Rescue] Appended %zu re-decided tracks at end "
+                    "(order not preserved; conductor first).\n",
+                    flagged_list.size()
+                );
+                fflush(stdout);
+            }
+
+            const double rescue_total_ms = rescue_timer.elapsed_ms();
+
+            std::printf(
+                "\n[Rescue] Timing breakdown:\n"
+                "  Parse:     %.1fms (avg: %.2fms/track)\n"
+                "  Segment:   %.1fms (avg: %.2fms/track)\n"
+                "  Write:     %.1fms (avg: %.2fms/track)\n"
+                "  Total:     %.1fms\n",
+                rescue_parse_ms,
+                rescue_parse_ms / flagged_list.size(),
+                rescue_seg_ms,
+                rescue_seg_ms / flagged_list.size(),
+                rescue_write_ms,
+                rescue_write_ms / flagged_list.size(),
+                rescue_total_ms
+            );
+            fflush(stdout);
+        }
+    }
 
     std::printf(
         "\nTotal notes: %zu -> %zu kept (%.2f%%)\n",
@@ -4046,8 +5657,10 @@ int wmain(int argc, wchar_t** argv) {
             : 0.0
     );
 
+    global_stats_acc.print();
+
     std::printf(
-        "\n[Phase 2b] Timing breakdown:\n"
+        "\n[Phase 2b] Timing breakdown (pass 1; rescue timed separately):\n"
         "  Parse:     %.1fms (avg: %.2fms/track)\n"
         "  Segment:   %.1fms (avg: %.2fms/track)\n"
         "  Write:     %.1fms (avg: %.2fms/track)\n"
@@ -4058,7 +5671,7 @@ int wmain(int argc, wchar_t** argv) {
         cumulative_segment / tracks.size(),
         cumulative_write,
         cumulative_write / tracks.size(),
-        total_phase2b_ms
+        pass1_phase2b_ms
     );
     fflush(stdout);
 
@@ -4084,6 +5697,12 @@ int wmain(int argc, wchar_t** argv) {
         "Total wall time: %.1fms\n",
         total_timer.elapsed_ms()
     );
+
+    double peak_mb = peak_working_set_mb();
+
+    if (peak_mb >= 0.0)
+        std::printf("Peak RAM Usage: %.1f MB\n", peak_mb);
+
     fflush(stdout);
 
     return 0;
