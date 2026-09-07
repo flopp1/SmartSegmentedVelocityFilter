@@ -54,16 +54,16 @@ Masking:
 
 Energy / Envelope (single exponential decay model):
 
-  `--tau-ms N`               tau in ms for the exponential decay
-                           model (default 0 = 500) - Higher makes a less steep drop off in simulated audio energy, lower a more steep drop
+  `--tau-ms N`             tau (time taken to decay by 1/e) in ms
+                           for the exponential decay model (default 500ms) - Higher makes a less steep drop off in simulated audio energy, lower a more steep drop
                            
   `--global-polyphony-cap N` approximate max concurrent audible voices;
                            caps the global energy curve to model a
                            real synth's voice stealing/limiting, so
-                           a dense crash's held/decaying note count
+                           a dense crash's held/decaying voice count
                            can't inflate the global average past what
-                           any real instrument could actually sound
-                           at once (default 0, 0 disables damping) - Honestly, just leave it at 0, it doesn't do that much at all. If you still want to use it, it will basically have no effect until you reach <1000. It doesn't even cap, it just imposes a damper globally, I don't even know why, since it's like scaling everything down, which changes nothing.
+                           the number of voices synths can practically
+                           sound at once (default 0, 0 disables damping) - Honestly, just leave it at 0, it doesn't do that much at all. If you still want to use it, it will basically have no effect until you reach <1000. It doesn't even cap, it just imposes a damper globally, I don't even know why, since it's like scaling everything down, which changes nothing.
 
 Realtime audibility (intensity-relative removal scale):
 
@@ -80,9 +80,7 @@ Realtime audibility (intensity-relative removal scale):
   `--ambient-gate N`     low-band rescue gate: the local ambient level
                        must reach this fraction of the file's
                        typical sounding level before quiet segments
-                       are rescued, so art passages dominated by
-                       their own quiet notes stay dropped (default
-                       1.0)
+                       are rescued (default 1.0)
                        
 ^ More fucking complicated shit from GLM. This one's for low velocity rescuing only but dependent on the relative energy levels of different parts, basically another attempt to filter arts and melody and noise and whatnot. Testing is around the same values as the audibility ratio on heavy merges too.
                        
@@ -90,13 +88,24 @@ Realtime audibility (intensity-relative removal scale):
 
 ^ You MUST play around with the two values if you want good results. The optimal settings vary wildly depending on the MIDI and depend on factors the program mostly cannot quantify or easily look at from a data processing POV. Humans are just too creative in making arts that are audio and audio that are arts and audio that isn't audio and arts that aren't arts.
 
+Second pass for rescue (lossy-filter exposure correction):
+  `--second-pass`             re-decide borderline tracks against the
+                            post-filter ambient (default off) - try the second pass if first pass tends to discard too much
+
+  `--rescue-margin N`         flag a dropped segment's track for rescue
+                            when ratio >= N * its ratio bar (default 0.80;
+                            lower flags more tracks) - also play around with this.
+
+  `--no-preserve-track-order` disable track-order preservation via temporary file
+                            (zero extra I/O, smaller memory) - it's not worth it at all, temp file reordering is basically free
+
 Other:
 
   `--threads N`          worker threads for the per-track scan
                        phases (default 0 = all hardware
-                       threads, output is identical) - Don't change unless you want the thing to run like Master Oogway does.
+                       threads) - why would you want to make it single threaded? just leave it lol
                        
-  `--global-bin-ms N`    masking curve resolution (default 50) - Pretty fucking coarse but I'm not interested in blowing up time complexity just for a bit more fine grainedness, which won't even matter anyway since segments are on the level of a second or two.
+  `--global-bin-ms N`    masking curve resolution (default 50ms) - Pretty fucking coarse but I'm not interested in blowing up time complexity just for a bit more fine grainedness, which won't even matter anyway since segments are on the level of a second or two.
   
   `--verbose`            print segment decisions - If you want the program to projectile vomit information at you.
   
